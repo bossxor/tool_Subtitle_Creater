@@ -9,6 +9,7 @@ exe 실행 폴더에 두면 core.config의 ROOT(=exe가 있는 폴더) 기준으
 """
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import PyInstaller.__main__
@@ -51,6 +52,14 @@ def main() -> None:
 
     print(f"nvidia DLL {len(collect_nvidia_binaries()) // 2}개 포함, 빌드 시작...")
     PyInstaller.__main__.run(args)
+
+    # PyInstaller가 nvidia 패키지 폴더(_internal/nvidia)를 통째로 또 복사해서, 위에서 평평하게 넣은
+    # DLL(_internal 바로 아래)과 중복된다(약 0.9GB). core/stt.py가 평평한 위치도 DLL 검색 경로에 올리므로
+    # 중복 폴더는 지워도 되고, 지운 빌드로 GPU 음성 인식+번역이 끝까지 도는 것을 확인했다.
+    dup = ROOT / "dist" / "Subtitle_Tool" / "_internal" / "nvidia"
+    if dup.exists():
+        shutil.rmtree(dup)
+        print(f"중복 CUDA DLL 폴더 제거: {dup}")
 
 
 if __name__ == "__main__":
