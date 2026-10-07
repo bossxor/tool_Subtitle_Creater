@@ -1,0 +1,14 @@
+faster-whisper==1.2.1
+ctranslate2==4.8.2
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cudnn-cu12==9.26.0.51
+nvidia-cuda-nvrtc-cu12==12.9.86
+PyYAML==6.0.3
+requests==2.34.2
+PySide6==6.11.2
+
+# 모델/샘플 다운로드용 (bench/ 스크립트에서만 사용, exe 배포에는 불필요)
+huggingface_hub==1.32.0
+
+# exe 빌드용 (개발 PC에서만 필요, exe 자체에는 포함 안 됨)
+pyinstaller==6.22.3

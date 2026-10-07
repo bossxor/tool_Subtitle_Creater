@@ -1,0 +1,63 @@
+# Subtitle_Tool 기본 설정
+# CLI 인자로 덮어쓸 수 있다.
+
+source_language: ja
+target_language: ko
+
+stt:
+  # "turbo" (기본, 빠름) 또는 "large" (고정밀)
+  precision: turbo
+  models:
+    turbo: models/whisper/large-v3-turbo
+    large: models/whisper/large-v3
+    kotoba: models/whisper/kotoba-v2.0
+  device: cuda
+  compute_type: float16
+  batch_size: 16
+  beam_size: 1
+
+llm:
+  server_exe: tools/llama.cpp/llama-server.exe
+  model: models/llm/Qwen3-8B-Q4_K_M.gguf
+  port: 8090
+  n_gpu_layers: 999
+  ctx_size: 8192
+  temperature: 0.3
+  max_tokens: 2000
+  batch_sentences: 25   # 한 번에 번역할 문장 수
+  context_sentences: 2  # 앞 배치에서 문맥으로 넘겨줄 문장 수
+  max_retries: 3
+
+segmenter:
+  max_cue_duration: 8.0     # 초. 이보다 길면 분할
+  min_cue_duration: 0.8
+  pause_split_gap: 0.6      # 초. 단어 사이 공백이 이보다 크면 문장 경계 후보
+  max_words_per_cue: 40
+  hallucination_blocklist:
+    - "ご視聴ありがとうございました"
+    - "ご視聴ありがとうございます"
+    - "チャンネル登録"
+    - "字幕視聴者のみなさん"
+    - "この動画が良かったら"
+    - "最後までご視聴いただき"
+
+subtitle:
+  max_lines: 2
+  max_chars_per_line: 20   # 한글 기준
+  min_display_sec: 1.0
+  max_display_sec: 7.0
+  max_cps: 15              # 초당 글자 수(읽는 속도) 상한
+  # 만들 출력 형식: srt / ass / smi 중 고르면 된다. 기본은 srt 하나만(영상 1개당 자막 파일 1개).
+  # srt는 꾸밈 없는 가장 호환성 좋은 표준 포맷이라 기본값으로 선택함. 스타일링이 필요하면 ass로 바꾸면 됨.
+  formats: [srt]
+  emit_source: false       # 원문(일본어) 자막도 만들지
+  bilingual: false         # 이중 자막(원문+번역 한 줄에)
+  # 기본은 BOM 있는 UTF-8(utf-8-sig). BOM이 없으면 곰플레이어 등 일부 플레이어가 한글을
+  # 시스템 기본 코드페이지(CP949)로 잘못 읽어 글자가 깨진다. 그래도 깨지면 cp949로 바꿔본다.
+  srt_encoding: utf-8-sig
+  ass_encoding: utf-8-sig
+  smi_encoding: utf-8-sig
+
+paths:
+  cache_dir: cache
+  models_dir: models

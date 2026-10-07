@@ -1,0 +1,232 @@
+# Subtitle Tool 설계서
+
+영상 여러 개를 선택하고 자막 저장 폴더를 지정하면, 음성 인식 → 번역 → 다듬기까지 자동으로 처리해 자막 파일을 만드는 Windows 데스크톱 도구.
+
+## 1. 요구사항
+
+| 항목 | 내용 |
+|---|---|
+| 입력 | 영상 여러 개 선택 (주로 일본어 영화·드라마, 1시간 이상) |
+| 출력 | 지정한 폴더에 `.srt` + `.smi` 저장. 옵션으로 원문(일본어) 자막, 이중 자막 |
+| 번역 | 일본어 → 한국어 (원어 자동 감지, 목표 언어와 같으면 교정만) |
+| 품질 | 오인식 교정, 구어체 정리, 자연스러운 한국어, 자막 규격 준수 |
+| 비용 | 토큰/API 비용 0. 모든 AI는 로컬 실행 (모델은 첫 실행 시 1회 다운로드) |
+| 성능 | 정확도 높고 빠르게. 이전 사용한 곰플레이어 자막 기능은 서버 기반이라 느렸음 |
+| 배포 | exe (폴더형 배포, `Subtitle_Tool.exe` 더블클릭) |
+
+## 2. 개발 PC 환경
+
+- GPU: NVIDIA RTX 3070 Ti, **VRAM 8GB** / RAM 62GB
+- VRAM 8GB라서 음성 인식 모델과 번역 LLM을 **동시에 올리지 않는다** (순차 로드).
+- 미설치: ffmpeg, Python 3.11 (확인 필요), CUDA 12용 cuDNN/cuBLAS
+
+## 3. 기술 스택
+
+| 단계 | 도구 | 비고 |
+|---|---|---|
+| 오디오 추출 | ffmpeg | 16kHz mono wav |
+| 무음 제거 | Silero VAD | faster-whisper 내장. 환각 감소 + 속도 향상 |
+| 음성 인식 | **faster-whisper** (CTranslate2) | 후보: `kotoba-whisper-v2.0-faster`(일본어 특화, 증류), `large-v3`, `large-v3-turbo` |
+| 번역 + 다듬기 | 로컬 LLM 8B급 Q4 (GGUF) | 후보: Qwen3-8B, Gemma3 등 → 5분 샘플로 A/B 비교 후 확정 |
+| LLM 런타임 | **llama.cpp 서버(CUDA 빌드)** | exe 폴더에 동봉, 내부에서 자동 실행. Ollama 설치 불필요 |
+| GUI | PySide6 | |
+| 패키징 | PyInstaller (**onedir**) | onefile은 CUDA 때문에 용량 2~3GB + 시작 매우 느림 |
+
+## 4. 처리 흐름
+
+```
+[GUI] 영상 다중 선택 + 출력 폴더 + 옵션(용어집/인물명)
+   │
+① 오디오 추출 (ffmpeg)         ← 다음 영상 추출을 GPU 작업과 동시에 진행
+   │
+   ▼ ── 전 영상 일괄 처리, Whisper 모델은 1회만 로드 ──
+② 음성 인식 (faster-whisper, GPU, 배치 추론)
+   → 언어 감지 + 문장별 타임스탬프 → cache/<영상>/raw.json
+   │
+   ▼ ── Whisper 언로드, LLM 1회만 로드 ──
+③ 세그먼트 정리 (짧은 자막 병합, 긴 자막 분할, 환각/비언어음 필터)
+④ 번역 (목표 언어와 다를 때만)
+   20~30문장 단위 + 앞뒤 문맥 + 용어집, JSON 배열로 입출력
+⑤ 다듬기 (오인식 교정, 구어체 정리, 줄바꿈)
+⑥ 검증 (문장 수 일치, 글자 수/초, 타임스탬프 무결성) → 실패한 배치만 재시도
+   │
+⑦ 출력: <영상명>.ko.srt / .ko.smi (+ 원문, 이중 자막)
+```
+
+핵심 원칙
+- **타임스탬프는 코드가 관리**하고 LLM에는 시간 정보를 주지 않는다 (텍스트만 변경) → 싱크 어긋남 방지.
+- **단계별 일괄 처리**로 모델 로드/언로드 횟수를 최소화한다.
+- 단계별 결과를 `cache/`에 저장 → 중단 후 재개, 번역만 다시 실행 가능.
+
+## 5. 음성 인식 속도 전략
+
+| 수단 | 효과 | 정확도 영향 |
+|---|---|---|
+| `BatchedInferencePipeline` (batch 16) | 약 5배 (실측) | 거의 없음 |
+| GPU `float16` | CPU 대비 10배 이상 | 없음 |
+| beam 5 → 1 | 약 1.5~2배 | 미미 |
+| 오디오 추출 파이프라이닝 | 대기시간 제거 | 없음 |
+
+### Phase 0 실측 결과 (2026-09-22, CC0 일본어 낭독 10분 32초 샘플, RTX 3070 Ti)
+
+배치 16, beam 1, float16, VAD on, `condition_on_previous_text=False` 조건.
+
+| 모델 | 처리 시간 | 배속 | 비고 |
+|---|---|---|---|
+| **large-v3-turbo** | 6.9초 | **91배속** | **채택.** large-v3와 문장이 거의 일치(차이 7.4%, 대부분 사소한 오탈자) |
+| kotoba-whisper-v2.0 | 7.0초 | 90배속 | 속도는 turbo와 동급이지만 **단어/문장 반복, 누락이 다수 발생**(large-v3 대비 차이 35%) → 기각 |
+| large-v3 | 38.4초 | 16.5배속 | 가장 정확하지만 느림. **"고정밀 모드" 옵션**으로 유지 |
+
+- **결론: 기본 모델은 `large-v3-turbo`.** 이 속도라면 2시간 영화 인식이 약 1.5~5분으로 예상됨 (낭독 샘플 기준, 실제 드라마에서는 배경음·겹침 대사로 다소 느려질 수 있음).
+- 배경음악 분리(demucs 등)는 느리므로 **기본 OFF**, 음악이 심한 영상용 옵션.
+- 환각 대응: `condition_on_previous_text=False`, `no_speech` 임계값, 반복 문장 제거, 무음 구간 상투구 차단 목록, 웃음/숨소리 필터.
+- **주의**: 배치 파이프라인이 VAD 청크를 길게 묶어서 세그먼트 1개가 20~30초에 달함. 자막 한 줄 기준(2~7초)에 맞추려면 `word_timestamps=True`로 단어 단위 시간을 받아 문장부호/CPS 기준으로 **재분할하는 단계가 필수**(Phase 1 `segmenter.py`).
+
+## 6. 번역/다듬기 전략 (일본어 → 한국어)
+
+- 앞뒤 문맥을 함께 전달해 대명사/생략된 주어를 보완한다.
+- 등장인물 이름·용어집을 입력받아 일관성 유지 (일본어 드라마는 이름/경어체 처리가 품질을 좌우).
+- 출력은 ID가 있는 JSON 배열로 고정, 개수/ID 불일치 시 해당 배치만 재시도.
+- 자막 규격: 2줄 이하, 한글 기준 줄당 약 16~20자, 읽는 속도(CPS) 제한, 최소/최대 표시 시간.
+
+### Phase 0 실측 결과 (Qwen3-8B-Q4_K_M, llama.cpp CUDA, 20문장 배치)
+
+- **Qwen3는 기본적으로 내부 사고(thinking) 토큰을 출력**하며, 이게 완료 토큰의 대부분을 차지해 느려짐(20문장 25.8초, 완료 토큰 1841개).
+  → 요청 시 `chat_template_kwargs: {"enable_thinking": false}` (+ 프롬프트에 `/no_think`)로 끄면 **7.1초로 3.6배 단축**, 품질 차이 없음. **항상 끄고 사용.**
+- 번역 품질은 전반적으로 자연스럽고 문맥도 잘 반영하지만, **일부 항목에서 한자/가나가 한글로 안 바뀌고 그대로 섞여 나오는 현상**이 재현됨 (예: "그帰り", "고男子"). 프롬프트에 "한 글자도 남기지 말고 전부 한글로" 지침을 강하게 추가해도 완전히 없어지지 않음 (20개 중 2개 잔존).
+  → **결론: 프롬프트만으로 해결 불가, §"검증" 단계(6번 문서 흐름의 ⑥)가 필수.** 후처리에서 `ko` 필드에 히라가나/가타카나/한자(U+3040–30FF, U+4E00–9FFF) 잔존 여부를 정규식으로 검사하고, 걸리면 해당 항목만 재요청.
+- 속도 환산: 20문장/7.1초 ≈ 초당 2.8문장. 1시간 영상 대사 600~900줄 기준 **약 4~5분** 예상(설계 추정과 일치).
+- 8B Q4 단일 후보로 확인 완료. 추가 후보(Gemma3 등) 비교는 시간 대비 효과가 낮다고 판단해 보류, 품질 이슈가 계속되면 재검토.
+
+## 7. 출력 형식
+
+- `.srt`: 기본. 인코딩 UTF-8.
+- `.smi` (SAMI): 시작 시간만 갖는 형식이라 종료를 빈 싱크(`&nbsp;`)로 표현. 인코딩은 설정 가능(기본 UTF-8, 플레이어에서 깨지면 CP949).
+- 옵션: 원문(일본어) 자막, 이중 자막(원문 + 번역).
+- 파일명: `<영상명>.ko.srt`, `<영상명>.ko.smi`
+
+## 8. 프로젝트 구조
+
+```
+Subtitle_Tool/
+├─ DESIGN.md
+├─ core/               # GUI와 분리된 파이프라인 (CLI로도 실행 가능)
+│  ├─ audio.py         ffmpeg 오디오 추출
+│  ├─ stt.py           faster-whisper 래퍼
+│  ├─ segmenter.py     병합/분할/환각 필터
+│  ├─ llm.py           llama.cpp 서버 실행/호출
+│  ├─ translate.py     번역 + 다듬기
+│  ├─ validate.py      검증/재시도
+│  ├─ writers.py       srt / smi / 이중 자막
+│  └─ pipeline.py      단계 실행 + 체크포인트
+├─ gui/                # PySide6: 파일 다중 선택, 출력 폴더, 진행률, 취소/재개
+├─ cache/              # 단계별 json
+├─ bench/              # Phase 0 벤치마크 스크립트
+└─ config.yaml         # 모델, 목표 언어, 자막 규격, 인코딩
+```
+
+## 9. 진행 단계
+
+| Phase | 내용 | 완료 기준 |
+|---|---|---|
+| 0 | 환경 설치(ffmpeg, Python, CUDA 라이브러리) + 10분 샘플로 STT 모델(kotoba / large-v3 / turbo)과 번역 LLM 후보 속도·정확도 실측 | **완료.** STT=large-v3-turbo(고정밀 옵션 large-v3), 번역=Qwen3-8B-Q4(enable_thinking off) 확정. 상세는 5·6절 참조 |
+| 1 | CLI 파이프라인 (인식 → 번역 → 다듬기 → 검증 → srt/smi) | **완료(1차).** `core/` 구현, 10분 샘플로 End-to-End 검증. 상세는 아래 참조 |
+| 2 | GUI (다중 선택, 출력 폴더, 진행률, 취소/재개, 용어집 입력) | **완료(1차).** PySide6, `gui/`+`main.py`. 자동 테스트로 정상 완료·취소 흐름 검증. 상세는 아래 참조 |
+| 3 | exe 패키징 (PyInstaller onedir + llama.cpp 동봉 + 모델 첫 실행 다운로드) | **완료(1차).** `build_exe.py`로 빌드, 이 PC에서 exe만으로 STT+번역 전체 파이프라인과 GUI 실행 확인. 상세는 아래 참조 |
+
+### Phase 1 구현 내용 (2026-09-22)
+
+`core/` 모듈: `config.py`(config.yaml 로더), `audio.py`(ffmpeg 추출), `stt.py`(large-v3-turbo, 단어 단위 타임스탬프), `segmenter.py`(문장부호+pause 기반 자막 길이 재분할, 환각 필터), `llm.py`(llama-server 기동/호출), `translate.py`(배치 번역+문맥 전달+재시도), `validate.py`(JSON 파싱, 한자/가나 잔존 검사), `writers.py`(줄바꿈, CPS 기반 표시시간 조정, srt/smi 출력), `pipeline.py`(단계별 오케스트레이션+캐시), `cli.py`(진입점). 실행: `python -m core.cli --videos a.mp4 b.mp4 --out-dir OUT`.
+
+**10분 CC0 샘플 End-to-End 결과**: 123개 cue 생성, 번역 소요 약 2분(재시도 포함), 캐시 재사용 시 0.5초. 검증·재시도 로직이 실제로 동작해 123개 중 3~5개(약 3%, 실행마다 약간 다름 — 고유명사·고어체 등 모델이 힘들어하는 항목)만 원문 유지로 안전하게 폴백됨.
+
+**주의사항**
+- 단어 단위 타임스탬프는 STT 정밀도(모델)에 따라 값이 달라지므로, `raw_words.<precision>.json` / `cues_source.<precision>.json`처럼 **캐시 파일명에 설정값을 포함**시켜야 한다. 번역 캐시도 `cues_translated.<target_lang>.json`으로 언어별로 분리. (처음엔 이걸 빠뜨려 설정을 바꿔도 옛 캐시가 재사용되는 버그가 있었음 — 수정 완료.)
+- 자막 표시 시간(`writers.build_display_cues`)은 STT 원 타임스탬프를 최대한 존중하되 CPS·최소/최대 표시시간 조건에 맞춰 종료 시각만 조정한다. 문장이 너무 길어 화면에 안 들어가는 경우 현재는 시간을 나누지 않고 2줄 안에서 줄바꿈만 한다 (시간 분할은 후속 개선 과제).
+- 이중 자막(원문+번역, config의 `subtitle.bilingual`)은 Phase 1 초안에서는 설정만 있고 실제 구현이 빠져 있었음 → Phase 2에서 `writers._compose_bilingual`로 구현 완료(번역 위, 원문 한 줄 아래).
+
+### Phase 2 구현 내용 (2026-09-22)
+
+`gui/` 모듈: `main_window.py`(PySide6 메인 창 — 영상 다중 선택/드래그앤드롭, 출력 폴더, 원어·번역 대상·STT 정밀도 옵션, 원문자막/이중자막 체크박스, 용어집 표, 시작/취소, 진행 로그), `worker.py`(파이프라인을 QThread에서 돌리는 `PipelineWorker`, `logging` 레코드를 로그창으로 중계하는 `QtLogHandler`). 실행: `python main.py`.
+
+- `core/pipeline.py`에 `progress_cb`(사람이 읽을 상태 문자열 콜백)와 `cancel_check`(취소 여부 콜백) 전 단계에 배선. 번역 단계는 영상 단위뿐 아니라 **배치 단위로도 취소를 체크**하도록 `translate_cues`에도 연결(영상 1개짜리 긴 번역 도중에도 취소가 먹히게 함). 순환 임포트를 피하려고 `PipelineCancelled` 예외는 `core/errors.py`로 분리.
+- 자동 테스트(`bench/gui_smoke_test.py`, `bench/gui_cancel_test.py`)로 "시작 → 완료" 정상 흐름과 "시작 → 취소 → 안전하게 중단"을 모두 검증함. GUI를 직접 띄워 레이아웃도 육안 확인.
+- **주의(Phase 3 전에 고려)**: `LlamaServer.stop()`은 자신이 띄운 프로세스만 종료한다. 앱이 정상 종료(창 닫기)될 때는 `closeEvent`가 취소 후 스레드 종료를 기다려 안전하지만, 앱이 비정상 종료(강제 종료, 크래시)되면 llama-server.exe 자식 프로세스가 고아로 남을 수 있음 (테스트 중 실제로 한 번 발생 — Phase 3에서 `core/cleanup.py`로 해결, 아래 참조).
+
+### Phase 3 구현 내용 (2026-09-22)
+
+`build_exe.py`: PyInstaller onedir로 `main.py`를 묶는다. `.venv\Scripts\python.exe build_exe.py` 실행 → `dist/Subtitle_Tool/Subtitle_Tool.exe` 생성. 모델(11GB)과 llama.cpp는 용량 때문에 **exe에 동봉하지 않고 exe 폴더 옆(`models/`, `tools/llama.cpp/`)에서 찾도록** 하고, 없으면 GUI가 첫 실행 시 `core/setup_assets.py`로 내려받는다.
+
+**exe로 묶으면서 겪은 문제와 해결**
+- **경로 기준점**: PyInstaller onedir는 exe 옆에 `_internal/`을 두고 그 안에서 모듈을 로드하므로, 기존 `Path(__file__).parent.parent` 방식(`core/config.py`)으로는 exe 폴더가 아니라 `_internal`이 잡혔다. → `core/config.py`에 frozen 여부를 판별해 `sys.executable`의 부모 폴더를 ROOT로 쓰는 `_detect_root()` 추가. `core/stt.py`의 CUDA DLL 검색 로직도 frozen일 때 exe 폴더/`_internal`을 추가로 뒤지게 확장.
+- **config.yaml 기본값**: exe 옆에 사용자가 아직 config.yaml을 안 두면, PyInstaller가 `_internal`에 함께 묶은 기본 config.yaml을 대신 읽도록 `Config.load()`에 폴백 추가.
+- **faster_whisper VAD 모델 누락**: 첫 빌드는 실행하자마자 `onnxruntime...NO_SUCHFILE: silero_vad_v6.onnx`로 즉시 죽었다. PyInstaller의 임포트 분석은 코드가 아닌 "패키지 내부 데이터 파일"(faster_whisper/assets/*.onnx)은 자동으로 못 찾는다 — `PyInstaller.utils.hooks.collect_data_files("faster_whisper")`로 명시적으로 포함시켜 해결.
+- **nvidia CUDA DLL**: `nvidia-cublas-cu12`/`nvidia-cudnn-cu12`의 DLL도 임포트 분석만으로는 못 찾을 수 있어 `build_exe.py`가 venv의 `nvidia/*/bin/*.dll`을 전부 찾아 `--add-binary`로 명시적으로 넣는다.
+- **고아 프로세스 정리**: `core/cleanup.py`의 `kill_orphan_llama_server()`를 `main.py` 시작 시 호출해, 우리 `tools/llama.cpp/llama-server.exe` 경로와 정확히 일치하는 이전 실행의 잔여 프로세스를 찾아 종료한다(다른 llama-server와 혼동하지 않게 실행 파일 경로로 판별). 실제 테스트 중 발생한 고아 프로세스로 검증함.
+- **`--windowed` 빌드는 콘솔이 없어 `print()` 출력이 사라진다**: 진단용 숨은 모드 `Subtitle_Tool.exe --selftest` (+ `--full-pipeline <영상> <출력폴더>`)를 만들어 검증했는데, 콘솔이 없으니 화면에 아무것도 안 보였다. 파일로 리다이렉트(`> selftest.log 2>&1`)해서 로그를 확인해야 했다 — 알아두면 유용한 디버깅 팁.
+
+**검증 결과**: 이 PC에서 `dist/Subtitle_Tool` 폴더에 기존 `models/`, `tools/`를 심볼릭 링크(junction)로 연결하고 `--selftest --full-pipeline`으로 10분 샘플을 끝까지 돌려 STT(CUDA)·LLM 서버(CUDA)·번역·검증·srt/smi 출력이 exe 단독으로 정상 동작함을 확인. GUI 모드(`Subtitle_Tool.exe`)도 정상적으로 창이 뜨는 것을 확인. dist 폴더 크기는 모델 제외 약 3.2GB(PySide6+CUDA 런타임 DLL이 대부분).
+
+**아직 검증 못 한 것**: 이 PC 자체가 개발 환경이라 "모델·도구가 정말 하나도 없는 깨끗한 PC"에서 첫 실행 다운로드 흐름 전체(수 GB 실다운로드)까지는 못 돌려봤다. `list_missing()`의 누락 감지 로직과 `_download_file()`의 실제 다운로드(작은 파일로 실측, content-length 있는 큰 파일도 헤더 확인함)는 각각 단위 테스트했지만, GUI 진행률 다이얼로그를 통한 전체 다운로드 흐름은 미검증 상태.
+
+### 사용성 개선 (2026-09-23, 사용자 피드백 반영)
+
+Phase 3 exe를 실제로 써본 뒤 받은 피드백 4가지를 모두 반영했다.
+
+- **덮어쓰기 확인**: 시작 전에 출력 폴더에 같은 이름의 자막 파일이 이미 있는지 확인하고 있으면 덮어쓸지 물어본다. `core/pipeline.py`의 `predict_output_paths()`가 실제로 실행하지 않고 결과 파일 경로만 미리 계산해주고, `gui/main_window.py`가 존재 여부를 검사해 `QMessageBox.question`으로 확인한다.
+- **실제 진행률(%) 표시**: 기존엔 그냥 "바쁨" 표시(끝을 모르는 마퀴)만 있었다. `core/pipeline.py`에 `ProgressTracker`를 추가해 영상 1개를 100으로 보고 단계별 비중(오디오 5·인식 25·세그먼트 2·번역 63·저장 5, 합 100)을 매겼다. 번역 단계는 시간이 가장 오래 걸리므로 배치 하나가 끝날 때마다 `63/배치수`만큼 쪼개서 더해 촘촘하게 올라가게 했다(`core/translate.py`의 `on_batch_done` 콜백). `gui/worker.py`가 `progress_fraction` 시그널로 GUI에 전달하고, 진행 표시줄이 실제 `%p%` 텍스트를 보여준다.
+- **작업 중 뜨는 검은 콘솔 창 제거**: 원인은 ffmpeg/llama-server.exe/powershell.exe가 전부 "콘솔 서브시스템" 프로그램이라, `--windowed`로 빌드한 우리 앱이 이들을 그냥 `subprocess`로 띄우면 Windows가 매번 새 콘솔 창을 만들어 깜빡였던 것. `core/procutil.py`에 `CREATE_NO_WINDOW` 플래그를 모아두고 `core/audio.py`(ffmpeg/ffprobe), `core/llm.py`(llama-server), `core/cleanup.py`(powershell) 전부에 적용해 해결.
+- **레이아웃 다듬기**: `gui/main_window.py`에 라이트 테마 스타일시트(카드형 그룹박스, 파란색 강조 버튼, 둥근 모서리, 탭/표/진행바 스타일)를 추가하고 여백·창 크기를 조정.
+
+### 추가 피드백 반영 (2026-10-05)
+
+- **플레이어에서 한글이 깨지는 문제**: 원인은 srt/smi를 BOM 없는 UTF-8로 저장해서였다. 곰플레이어 등 일부 플레이어는 BOM이 없으면 시스템 기본 코드페이지(한국어 Windows는 CP949)로 잘못 추측해 읽어서 한글이 깨진 글자로 보인다. `core/writers.py`의 `write_srt`/`write_smi` 기본 인코딩을 `utf-8-sig`(BOM 포함)로 바꾸고, `config.yaml`에 `subtitle.srt_encoding`/`subtitle.smi_encoding` 둘 다 `utf-8-sig`로 설정(그래도 깨지면 `cp949`로 바꿔볼 수 있게 옵션은 유지). BOM이 실제로 붙는지 바이트 단위로 확인함.
+- **폴더째로 추가 + 이미 자막 있는 영상 자동 제외**: `gui/main_window.py`에 "폴더 추가..." 버튼 추가. 폴더(하위 폴더 포함)를 훑어 영상 파일을 찾고, `core/pipeline.py`의 `predict_output_paths()`로 각 영상의 예상 출력 경로를 계산해서, 출력 폴더에 그 경로가 이미 하나라도 있으면 "이미 자막 있음"으로 보고 목록에서 제외한다. 출력 폴더를 먼저 지정해야 판단할 수 있어서, 안 돼 있으면 먼저 지정하라고 안내한다.
+  - **판단 기준**: "자막 있음"은 영상 파일 옆이 아니라 **지정한 출력 폴더** 기준이다 — 이 도구가 만드는 자막은 영상과 다른 폴더에 저장되는 구조라서, 그게 유일하게 확실히 판단할 수 있는 기준이다. 영상 폴더에 다른 데서 받은 자막이 섞여 있어도 그건 인식하지 못한다.
+- **출력 포맷을 srt+ass로 통합**: 사용자가 "최신 포맷인 srt/ass로 통합하고 싶다"고 요청해서 기본값을 `[srt, smi]` → `[srt, ass]`로 바꿨다. `core/writers.py`에 `write_ass()`를 새로 구현(ASS v4.00+, BOM 포함 utf-8-sig, `{`/`}` 는 오버라이드 태그로 해석되니 전각문자로 치환, 줄바꿈은 `\N`). `core/pipeline.py`의 `predict_output_paths`/`stage_write`를 포맷 목록을 순회하는 공용 로직으로 일반화(`SUBTITLE_FORMATS = ("srt","ass","smi")`)해서 srt/ass/smi 어떤 조합이든 같은 코드로 처리되게 함. GUI 옵션 탭에 srt/ass/smi 체크박스 추가(기본 srt+ass 체크, smi는 "곰플레이어 구버전 호환용"이라고 설명 달아 옵션으로 남김). 실제로 srt+ass가 만들어지는 것까지 확인함.
+- **기존 smi 자막 자동 변환**: 포맷을 바꾸면서, 예전에 이 도구(또는 다른 데)로 만든 .smi 자막이 있는 영상을 다시 AI로 처리하지 않고 포맷만 바꿔주는 기능 추가. `core/converters.py`에 `parse_smi()`(SYNC 태그 파싱, 빈 싱크는 이전 cue의 종료 시각으로 처리, html.unescape로 엔티티 디코드)와 `convert_smi_file()` 구현. round-trip(write_smi→parse_smi) 테스트로 검증함.
+
+### 폴더 자동 정리 (2026-10-05)
+
+사용자 요청: "폴더 지정하면 기존 smi/srt/ass 다 확인해서 인코딩 이상하면 고치고, smi는 최신 포맷(srt/ass)으로 변환하고(원본 삭제 여부는 선택), 자막 없으면 AI로 만들어주는 걸 전부 알아서 하게 해줘."
+
+- `core/encoding_fix.py`: 인코딩 자동 감지(`detect_and_decode`) — UTF-8 BOM(정상) → BOM 없는 UTF-8 → CP949(옛날 한국 자막 흔함) → UTF-16 순서로 시도. `fix_encoding_file()`은 내용은 그대로 두고 BOM 있는 UTF-8로 재저장. 확신 안 서면(=위 인코딩 어느 것도 아니면) 손대지 않고 넘어감.
+- `core/converters.py`의 `parse_smi()`도 이 인코딩 자동 감지를 쓰도록 변경(예전 smi는 CP949로 저장된 경우가 많아서 이게 중요함). `extract_lang_suffix()`로 `ep01.ko.smi` 같은 파일명에서 언어 코드도 뽑아낸다.
+- `core/folder_scan.py` 신규: 영상마다 `find_subtitle_files()`로 출력 폴더+영상 폴더에서 `stem[.lang].{srt,ass,smi}` 패턴의 기존 자막을 전부 찾고, `plan_folder()`가 영상을 세 그룹으로 분류한다 — ① smi 있음→변환 대상, ② srt/ass 있는데 인코딩 의심→수정 대상, ③ 자막 전혀 없음→AI 생성 대상(이미 정상인 srt/ass가 있으면 아무것도 안 함). `run_conversions()`가 변환/수정을 실제로 실행하고, 원본 smi 삭제 여부는 호출부 플래그로 받는다.
+- `gui/main_window.py`의 "폴더 추가" 버튼이 이 전체 로직을 쓰도록 교체. 무엇을 할지 요약해서 한 번 확인받고(변환 N개/인코딩 수정 N개/AI 생성 목록에 추가 N개) 진행. "폴더 추가 시 smi를 srt/ass로 변환한 뒤 원본 smi 삭제" 체크박스 추가(기본 OFF — 삭제는 되돌릴 수 없는 작업이라 기본은 보존).
+- srt/ass 중 뭘 쓸지는 사용자가 "알아서 정하라"고 해서, 기존 결정대로 **둘 다** 만든다(옵션 체크박스로 조절 가능).
+- 인코딩 섞인 경우(smi+깨진 srt+정상 srt+자막없음)를 한 폴더에 다 넣고 테스트해서 네 가지 모두 올바르게 분류·처리되는 것 확인함.
+
+### 수정: 포맷 1개만 + smi 변환에 AI 검수 추가 (2026-10-05)
+
+사용자 피드백: "srt/ass 둘 다 만들면 자막 파일이 두 개라 헷갈린다, 하나만. smi 변환도 AI로 확인은 해줘야 한다."
+
+- **포맷 기본값을 srt 하나로**: `config.yaml`의 `subtitle.formats` 기본값을 `[srt, ass]` → `[srt]`로 변경. srt를 고른 이유: 꾸밈 없는 가장 호환성 좋은 표준 포맷이고(곰플레이어 포함 어디서나 재생), 이 도구가 만드는 건 스타일링이 필요 없는 평범한 대사 번역이라 ass의 스타일 기능이 필요 없음. GUI 체크박스도 srt만 기본 체크로 변경. 여러 개 체크하면 그만큼 파일이 따로 생긴다는 걸 툴팁으로 안내.
+- **smi 변환에 AI 검수 추가**: 이전엔 smi→srt/ass가 순수 포맷 변환(파싱해서 그대로 다시 쓰기)이었는데, "AI로 확인은 해줘야 한다"는 요청에 맞춰 LLM 검수 단계를 끼워 넣었다. `core/translate.py`에 `verify_cues()` 신규(번역이 아니라 검수 전용 프롬프트: "내용/어조/의미는 절대 바꾸지 말고, 인코딩 오류로 깨진 글자나 이상한 기호만 자연스럽게 복원하거나 제거하라", temperature 0.1로 보수적으로). `core/converters.py`를 `parse_smi()`(파싱)와 `write_cues_as()`(쓰기)로 분리해서 그 사이에 검수 단계를 끼울 수 있게 함. `core/folder_scan.py`의 `run_conversions()`가 smi 변환 작업이 있을 때만 LLM 서버를 띄워서 각 smi를 파싱→AI 검수→저장한다.
+- **GUI 비동기화**: AI 검수가 들어가면서 변환 작업이 더는 "즉시 끝나는" 일이 아니게 돼서, 동기 처리였던 걸 `gui/folder_worker.py`의 `FolderCleanupWorker`(QThread)로 바꾸고 진행 다이얼로그(취소 가능)를 띄우도록 `gui/main_window.py`도 수정.
+- **검증하며 알게 된 점**: 멀쩡한 문장은 토씨 하나 안 건드리고 그대로 두는 것까지 확인. 다만 **진짜로 복구 불가능한 깨진 글자**를 테스트해보니(실제 인코딩 오류가 아니라 일부러 무작위 깨진 문자열을 넣은 경우) AI가 "복원"한답시고 그럴듯하지만 전혀 다른 내용을 지어내는 걸 확인함 — 실제 사용에서는 `core/encoding_fix.py`의 자동 인코딩 감지(BOM/UTF-8/CP949/UTF-16)가 "파일 전체가 잘못된 인코딩으로 저장된" 흔한 경우를 이미 100% 결정론적으로 고쳐주기 때문에 AI 검수까지 갈 일은 드물고, AI 검수는 그 이후에 남는 자잘한 깨진 글자를 보완하는 역할이라고 보면 된다. 완전히 복구 불가능한 바이너리 손상 같은 극단적 경우까지 AI가 안전하게 처리한다고 보장할 수는 없음 — 알아두면 좋은 한계.
+
+### 버그 수정: UI 글자 겹침 + 폴더 추가 후 자동 시작 (2026-10-05)
+
+사용자가 "UI에서 글자가 겹쳐 보인다", "폴더 추가하고 시작 버튼 안 눌러도 알아서 시작된다" 두 가지를 신고함.
+
+- **글자 겹침의 진짜 원인**: 처음엔 QGroupBox 제목 높이 부족이나 QSS로 키운 QComboBox의 sizeHint 불일치(`form.addLayout()`로 바로 끼운 행이 다음 행과 겹침)를 의심해서 각각 고쳤지만(제목 여백 늘림, 행마다 실제 QWidget으로 감싸기), 그래도 재현됐다. 위젯 geometry를 직접 덤프해서 진짜 원인을 찾음: **창의 `setMinimumSize`를 760×620으로 못박아놨는데, 실제 내용물의 `minimumSizeHint`는 668×859로 239px나 더 필요했다.** 공간이 모자라니 Qt가 "3. 옵션" 영역(중첩이 가장 깊어서 우선순위가 밀림)을 강제로 쥐어짜 글자가 다닥다닥 겹쳐 보인 것. `resize(900,1000)` / `setMinimumSize(760,880)`로 넉넉하게 잡아서 해결. (콤보박스 sizeHint 문제와 제목 여백도 사소하게는 영향 있었어서 그 수정들도 같이 유지함.)
+- **폴더 추가 후 자동 시작의 진짜 원인**: "폴더 추가" 버튼 핸들러가 smi 변환/인코딩 수정을 돌릴 때 `QProgressDialog` + 중첩 `QEventLoop`로 기다리는데, 이 다이얼로그에 **모달 설정을 안 해놔서** 뒤의 메인 창이 계속 클릭을 받을 수 있는 상태였다. 그 틈에 들어온 클릭이 "자막 생성 시작" 버튼으로 전달돼 의도치 않게 파이프라인이 시작된 것. `dlg.setWindowModality(Qt.WindowModal)`을 두 곳(폴더 정리, 첫 실행 다운로드)에 모두 추가해서 다이얼로그가 떠 있는 동안 메인 창이 완전히 막히게 고침. 추가로 `_on_start()`에 이미 실행 중이면 무시하는 가드도 넣어 이중 안전장치를 둠.
+- 두 수정 다 GUI를 직접 띄워 위젯 geometry를 찍어보고 스크린샷으로 재확인함. 기존 자동 테스트(`bench/gui_smoke_test.py`, `bench/gui_cancel_test.py`)도 재통과시킴.
+
+## 10. 후속 개선 (범위 외, 필요 시)
+
+- WhisperX 강제정렬로 단어 단위 싱크 보정
+- 화자 분리
+- STT와 LLM 동시 상주(VRAM 여유 시)로 영상 간 파이프라인 오버랩
+- 실제 일본어 드라마/영화 클립(배경음악·겹침 대사 포함)으로 재벤치마크. Phase 0 샘플은 CC0 낭독이라 드라마 환경(BGM, 다중 화자, 겹치는 대사)의 정확도를 대표하지 못함
+
+### 진행 개수 표시 + 최종 결과 표 (2026-10-05)
+
+사용자 요청: "smi 변환 N개 중 k개 완료, 자막생성 N개 중 k개 완료로 구분해서 보여주고, 끝나면 진행 결과 다 보여줘."
+
+- `gui/progress_model.py`의 `StageTracker`가 진행 메시지 `[단계 k/N] 파일명`을 받아서 단계별 개수를 계산한다(Qt 없이 단위 테스트 가능). 표시 줄: `smi 변환: N개 중 k개 완료`, `인코딩 수정: N개 중 k개 완료`, `자막생성: N개 중 k개 완료`(완료 기준은 "자막 저장" 단계), 현재 작업 한 줄.
+- 폴더 정리 메시지는 단계별 번호로 바꿔서(smi 개수, 인코딩 개수 각각) 섞이지 않게 했다(`core/folder_scan.py`).
+- 진행창 진행바는 smi 변환 + 인코딩 수정을 합친 실제 완료 수로 움직인다.
+- 끝나면 결과 표(구분 / 파일 / 상태 / 결과)를 메인 창에 띄운다: smi 변환(완료/실패), 인코딩 수정(수정함/변경없음/실패), 자막생성(완료/취소됨/실패 + 결과 파일명), 자막생성 대기열 추가분. 자막생성 완료 시 소요 시간도 표시.
+- 헤드리스 테스트로 개수 문구와 결과 행 생성을 확인했고, 기존 smoke 테스트도 통과. exe 재빌드 및 selftest 통과.
