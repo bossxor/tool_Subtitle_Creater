@@ -17,3 +17,4 @@ bench/sample/
 .claude/
 *.log
 *.part
+dist_preserve/

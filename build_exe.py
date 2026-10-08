@@ -9,7 +9,9 @@ exe 실행 폴더에 두면 core.config의 ROOT(=exe가 있는 폴더) 기준으
 """
 from __future__ import annotations
 
+import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import PyInstaller.__main__
@@ -17,6 +19,50 @@ from PyInstaller.utils.hooks import collect_data_files
 
 ROOT = Path(__file__).resolve().parent
 VENV_SITE = ROOT / ".venv" / "Lib" / "site-packages"
+DIST_APP = ROOT / "dist" / "Subtitle_Tool"
+PRESERVE_DIR = ROOT / "dist_preserve"
+# exe 폴더 안에 쌓이는 사용자 데이터. PyInstaller는 빌드 때 dist/Subtitle_Tool을 통째로 지우므로
+# (캐시에는 몇 시간짜리 음성 인식/번역 결과가 들어 있을 수 있다) 빌드 전에 빼 뒀다가 되돌린다.
+USER_DATA = ("cache", "models", "tools")
+
+
+def preserve_user_data() -> dict[str, tuple[str, str]]:
+    """{이름: ("junction", 대상경로) | ("dir", 보관경로)}. 아무것도 지우지 않고 옮기기만 한다."""
+    saved: dict[str, tuple[str, str]] = {}
+    for name in USER_DATA:
+        path = DIST_APP / name
+        if not path.exists():
+            continue
+        try:
+            target = os.readlink(path)  # junction/심볼릭 링크일 때만 성공
+        except OSError:
+            target = None
+        if target is not None:
+            os.rmdir(path)  # 링크만 제거(가리키는 실제 폴더는 그대로)
+            saved[name] = ("junction", target.removeprefix("\\\\?\\"))
+        else:
+            PRESERVE_DIR.mkdir(exist_ok=True)
+            dest = PRESERVE_DIR / name
+            if dest.exists():
+                raise SystemExit(f"{dest} 가 이미 있어 덮어쓸 수 없습니다. 내용을 확인하고 직접 옮겨 주세요.")
+            shutil.move(str(path), str(dest))
+            saved[name] = ("dir", str(dest))
+    return saved
+
+
+def restore_user_data(saved: dict[str, tuple[str, str]]) -> None:
+    for name, (kind, where) in saved.items():
+        path = DIST_APP / name
+        if path.exists():
+            print(f"경고: {path} 가 이미 있어 {name} 복원을 건너뜁니다 (보관본: {where})")
+            continue
+        if kind == "junction":
+            subprocess.run(["cmd", "/c", "mklink", "/J", str(path), where], check=True, capture_output=True)
+        else:
+            shutil.move(where, str(path))
+        print(f"사용자 데이터 복원: {name}")
+    if PRESERVE_DIR.exists() and not any(PRESERVE_DIR.iterdir()):
+        PRESERVE_DIR.rmdir()
 
 
 def collect_nvidia_binaries() -> list[str]:
@@ -51,7 +97,13 @@ def main() -> None:
         args += ["--add-data", f"{src};{dest}"]
 
     print(f"nvidia DLL {len(collect_nvidia_binaries()) // 2}개 포함, 빌드 시작...")
-    PyInstaller.__main__.run(args)
+    saved = preserve_user_data()
+    try:
+        PyInstaller.__main__.run(args)
+    finally:
+        # 빌드가 실패해도 사용자 데이터는 반드시 되돌린다
+        DIST_APP.mkdir(parents=True, exist_ok=True)
+        restore_user_data(saved)
 
     # PyInstaller가 nvidia 패키지 폴더(_internal/nvidia)를 통째로 또 복사해서, 위에서 평평하게 넣은
     # DLL(_internal 바로 아래)과 중복된다(약 0.9GB). core/stt.py가 평평한 위치도 DLL 검색 경로에 올리므로

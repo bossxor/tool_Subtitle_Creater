@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from core.errors import PipelineCancelled
 from core.llm import LlamaServer
 from core.segmenter import Cue
+from core.textfix import collapse_repeats, is_kana_only, kana_to_hangul
 from core.validate import validate_batch
 
 logger = logging.getLogger(__name__)
@@ -23,11 +24,14 @@ _LANG_NAMES = {"ja": "일본어", "ko": "한국어", "en": "영어"}
 @dataclass
 class TranslateReport:
     total: int = 0
-    failed_ids: list[int] | None = None
+    failed_ids: list[int] | None = None  # 끝내 번역 못 해서 일본어 원문이 남은 id
+    transliterated_ids: list[int] | None = None  # 가나뿐이라 소리 나는 대로 한글로 옮긴 id
 
     def __post_init__(self):
         if self.failed_ids is None:
             self.failed_ids = []
+        if self.transliterated_ids is None:
+            self.transliterated_ids = []
 
 
 def _lang_name(code: str) -> str:
@@ -51,14 +55,30 @@ def _build_system_prompt(source_lang: str, target_lang: str, glossary: dict[str,
         pairs = "; ".join(f"{k} -> {v}" for k, v in glossary.items())
         parts.append(f"다음 용어/인명은 반드시 이렇게 번역하세요: {pairs}")
     parts.append(
+        "항목에 'avoid' 필드가 있으면, 이전 번역에 그 글자가 그대로 남아서 거절됐다는 뜻입니다. "
+        "그 글자를 쓰지 말고 뜻을 한글로 풀어서 쓰세요."
+    )
+    parts.append(
+        "한숨, 신음, 감탄사처럼 뜻이 없는 소리는 소리 나는 대로 한글로 적으세요 (예: あっ -> 앗, はぁ -> 하아). "
+        "같은 소리가 길게 반복되면 3번까지만 적으세요."
+    )
+    parts.append(
         "출력은 반드시 JSON 배열만 반환하세요. 각 항목은 {id, ko} 형식이어야 하고, "
         "'items'와 같은 개수, 같은 id를 모두 포함해야 합니다. 설명이나 코드블록 없이 순수 JSON 배열만 출력하세요."
     )
     return "\n".join(parts) + "\n/no_think"
 
 
-def _build_user_payload(cues: list[Cue], context_pairs: list[tuple[str, str]]) -> str:
-    payload: dict = {"items": [{"id": c.id, "ja": c.text} for c in cues]}
+def _build_user_payload(
+    cues: list[Cue], context_pairs: list[tuple[str, str]], avoid: dict[int, str] | None = None
+) -> str:
+    items = []
+    for c in cues:
+        item = {"id": c.id, "ja": c.text}
+        if avoid and avoid.get(c.id):
+            item["avoid"] = avoid[c.id]
+        items.append(item)
+    payload: dict = {"items": items}
     if context_pairs:
         payload["context"] = [{"ja": ja, "ko": ko} for ja, ko in context_pairs]
     return json.dumps(payload, ensure_ascii=False)
@@ -173,19 +193,29 @@ def translate_cues(
     report = TranslateReport(total=len(cues))
     prev_context: list[tuple[str, str]] = []
 
-    for start in range(0, len(cues), batch_size):
+    # 같은 소리가 수십~수백 글자 반복되는 줄(음성 인식 반복 루프, 신음 등)은 LLM이 반복 출력으로
+    # 토큰을 다 써서 JSON이 잘리는 원인이었다. LLM에 보내기 전에 3번 반복으로 줄인다.
+    work_cues = [Cue(id=c.id, start=c.start, end=c.end, text=collapse_repeats(c.text)) for c in cues]
+
+    for start in range(0, len(work_cues), batch_size):
         if cancel_check is not None and cancel_check():
             raise PipelineCancelled()
-        batch = cues[start : start + batch_size]
+        batch = work_cues[start : start + batch_size]
         by_id: dict[int, str] = {}
         pending = list(batch)
         ctx = prev_context
+        avoid: dict[int, str] = {}  # 이전 시도에서 번역문에 남은 일본 문자 (재시도 힌트)
+        # 출력은 입력 글자 수에 비례해 길어지므로, 긴 줄이 있는 배치는 한도를 넉넉히 준다
+        batch_max_tokens = max(max_tokens, min(4000, 400 + 3 * sum(len(c.text) for c in batch)))
 
         for attempt in range(max_retries):
             expected_ids = [c.id for c in pending]
-            user = _build_user_payload(pending, ctx)
+            user = _build_user_payload(pending, ctx, avoid)
             try:
-                raw = llm.chat(system, user, temperature=temperature, max_tokens=max_tokens)
+                # 같은 입력에 같은 답이 반복되는 걸 피하려고 재시도마다 온도를 조금씩 올린다
+                raw = llm.chat(
+                    system, user, temperature=temperature + 0.25 * attempt, max_tokens=batch_max_tokens
+                )
             except Exception:
                 logger.exception("LLM 호출 실패 (batch start=%s, attempt=%s)", start, attempt)
                 if attempt == max_retries - 1:
@@ -198,16 +228,22 @@ def translate_cues(
                 logger.warning("번역 배치 검증 문제(attempt %s): %s", attempt, vr.error)
             if vr.ok:
                 break
+            avoid.update(vr.leaked_chars or {})
             pending = [c for c in pending if c.id in vr.bad_ids]
             ctx = []  # 재시도에서는 문맥 없이 문제 항목만 다시 시도해 프롬프트를 단순화한다
             if not pending:
                 break
 
-        # 끝까지 실패한 항목은 원문을 그대로 채워 파이프라인이 멈추지 않게 한다
+        # 끝까지 실패한 항목: 가나뿐이면 소리 나는 대로 한글로 옮기고, 한자가 섞여 있으면 일본어
+        # 원문을 그대로 둔다 (파이프라인이 멈추지 않게 하고, 어느 줄인지 보고서에 남긴다)
         for c in batch:
             if c.id not in by_id:
-                by_id[c.id] = c.text
-                report.failed_ids.append(c.id)
+                if is_kana_only(c.text):
+                    by_id[c.id] = kana_to_hangul(c.text)
+                    report.transliterated_ids.append(c.id)
+                else:
+                    by_id[c.id] = c.text
+                    report.failed_ids.append(c.id)
 
         results.update(by_id)
         if on_batch_done is not None:

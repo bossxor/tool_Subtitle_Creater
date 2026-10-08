@@ -21,15 +21,33 @@ def parse_translation_json(raw: str) -> list[dict]:
         text = text.split("\n", 1)[-1] if "\n" in text else text
     start = text.find("[")
     end = text.rfind("]")
-    if start == -1 or end == -1 or end < start:
-        raise TranslationParseError(f"JSON 배열을 찾지 못함: {raw[:200]!r}")
-    try:
-        data = json.loads(text[start : end + 1])
-    except json.JSONDecodeError as e:
-        raise TranslationParseError(f"JSON 파싱 실패: {e}") from e
-    if not isinstance(data, list):
-        raise TranslationParseError("최상위가 배열이 아님")
-    return data
+    if start != -1 and end > start:
+        try:
+            data = json.loads(text[start : end + 1])
+            if isinstance(data, list):
+                return data
+        except json.JSONDecodeError:
+            pass  # 아래 복구 경로로 넘어간다
+    # 출력이 max_tokens에서 잘려 닫는 ']'가 없거나 JSON이 깨진 경우: 이미 끝까지 나온 항목만이라도
+    # 건진다. 전부 버리고 25줄을 통째로 다시 시키면 같은 곳에서 또 잘리기 때문이다.
+    recovered = _recover_items(text)
+    if recovered:
+        return recovered
+    raise TranslationParseError(f"JSON 배열을 찾지 못함: {raw[:200]!r}")
+
+
+_ITEM_RE = re.compile(r'\{\s*"id"\s*:\s*(\d+)\s*,\s*"ko"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}')
+
+
+def _recover_items(text: str) -> list[dict]:
+    items = []
+    for m in _ITEM_RE.finditer(text):
+        try:
+            ko = json.loads('"' + m.group(2) + '"')
+        except json.JSONDecodeError:
+            continue
+        items.append({"id": int(m.group(1)), "ko": ko})
+    return items
 
 
 def has_leftover_source_script(text: str) -> bool:
@@ -43,6 +61,7 @@ class BatchValidationResult:
     by_id: dict[int, str]  # id -> ko text (성공한 것만)
     bad_ids: list[int]  # 잔존 문자 등으로 재시도 필요한 id
     error: str | None = None
+    leaked_chars: dict[int, str] | None = None  # id -> 번역문에 남은 일본 문자들 (재시도 힌트용)
 
 
 def validate_batch(expected_ids: list[int], raw_response: str) -> BatchValidationResult:
@@ -65,6 +84,7 @@ def validate_batch(expected_ids: list[int], raw_response: str) -> BatchValidatio
     leaked = [i for i in expected_ids if i in by_id and has_leftover_source_script(by_id[i])]
     bad_ids = sorted(set(missing) | set(leaked))
 
+    leaked_chars = {i: "".join(dict.fromkeys(_JA_CHAR_RE.findall(by_id[i]))) for i in leaked}
     for i in leaked:
         del by_id[i]
 
@@ -75,4 +95,4 @@ def validate_batch(expected_ids: list[int], raw_response: str) -> BatchValidatio
     if leaked:
         error = (error + "; " if error else "") + f"원어 문자 잔존 id: {leaked}"
 
-    return BatchValidationResult(ok=ok, by_id=by_id, bad_ids=bad_ids, error=error)
+    return BatchValidationResult(ok=ok, by_id=by_id, bad_ids=bad_ids, error=error, leaked_chars=leaked_chars)
