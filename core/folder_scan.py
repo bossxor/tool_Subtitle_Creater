@@ -244,12 +244,12 @@ def run_conversions(
                 fixed += 1
             if worklog:
                 worklog.event(
-                    "인코딩 수정", job.path.name, "수정함" if job.fixed else "변경 없음",
+                    "인코딩 수정", str(job.path), "수정함" if job.fixed else "변경 없음",
                     "BOM 있는 UTF-8로 다시 저장" if job.fixed else "이미 정상이거나 인코딩을 확신할 수 없어 그대로 둠",
                 )
         except Exception as e:  # noqa: BLE001
             job.error = str(e)
             if worklog:
-                worklog.event("인코딩 수정", job.path.name, "실패", job.error.splitlines()[0][:200] if job.error else "")
+                worklog.event("인코딩 수정", str(job.path), "실패", job.error.splitlines()[0][:200] if job.error else "")
 
     return converted, fixed, deleted

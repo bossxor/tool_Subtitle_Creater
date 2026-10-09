@@ -41,5 +41,11 @@ def fix_encoding_file(path: Path) -> bool:
     text = detect_and_decode(raw)
     if text is None:
         return False
-    path.write_text(text, encoding="utf-8-sig")
+    # Windows denies CREATE_ALWAYS (write_text's "w" mode) for hidden files.
+    # Open the existing file for update instead, preserving hidden attributes
+    # and the decoded text's original line endings.
+    encoded = text.encode("utf-8-sig")
+    with path.open("r+b") as stream:
+        stream.write(encoded)
+        stream.truncate()
     return True
