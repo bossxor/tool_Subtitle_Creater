@@ -64,7 +64,7 @@ class FolderScanPlan:
     encoding_fix_jobs: list[EncodingFixJob]  # srt/ass 인코딩만 고치면 되는 것
 
 
-def plan_folder(videos: list[Path], out_dir: Path, config) -> FolderScanPlan:
+def plan_folder(videos: list[Path], out_dir: Path, config, cancel_check=None, progress_cb=None) -> FolderScanPlan:
     out_dir = Path(out_dir)
     target_lang = config.get("target_language", "ko")
 
@@ -72,20 +72,53 @@ def plan_folder(videos: list[Path], out_dir: Path, config) -> FolderScanPlan:
     convert_jobs: list[ConvertJob] = []
     encoding_fix_jobs: list[EncodingFixJob] = []
 
-    for v in videos:
+    # Index each directory once rather than reading it again for every video.
+    indexes = {}
+    seen_convert = set()
+    seen_fix = set()
+
+    def check_cancel():
+        if cancel_check is not None and cancel_check():
+            raise PipelineCancelled()
+
+    def indexed_subtitles(directory):
+        directory = Path(directory)
+        if directory not in indexes:
+            index = {}
+            if directory.is_dir():
+                for path in directory.iterdir():
+                    check_cancel()
+                    if path.suffix.lower().lstrip(".") not in SUB_EXTS or not path.is_file():
+                        continue
+                    name = path.stem.casefold()
+                    for key in {name, name.rsplit(".", 1)[0]}:
+                        index.setdefault(key, []).append(path)
+            indexes[directory] = index
+        return indexes[directory]
+
+    for i, v in enumerate(videos, 1):
+        check_cancel()
+        if progress_cb:
+            progress_cb(f"자막 상태 확인 {i}/{len(videos)} · {Path(v).name}")
         v = Path(v)
         dirs = [out_dir, v.parent]
-        subs = find_subtitle_files(v.stem, dirs)
+        subs = {}
+        for directory in dirs:
+            for path in indexed_subtitles(directory).get(v.stem.casefold(), []):
+                subs.setdefault(path.resolve(), path)
         if not subs:
             generate.append(v)
             continue
 
-        for s in subs:
+        for resolved, s in subs.items():
             ext = s.suffix.lower().lstrip(".")
-            if ext == "smi":
+            if ext == "smi" and resolved not in seen_convert:
                 convert_jobs.append(ConvertJob(video=v, smi_path=s))
-            elif needs_fix(s):
-                encoding_fix_jobs.append(EncodingFixJob(path=s))
+                seen_convert.add(resolved)
+            elif ext != "smi" and resolved not in seen_fix:
+                seen_fix.add(resolved)
+                if needs_fix(s):
+                    encoding_fix_jobs.append(EncodingFixJob(path=s))
 
     return FolderScanPlan(generate=generate, convert_jobs=convert_jobs, encoding_fix_jobs=encoding_fix_jobs)
 
@@ -98,12 +131,13 @@ def run_conversions(
     progress_cb=None,
     cancel_check=None,
     worklog: WorkLog | None = None,
+    verify_with_ai: bool = True,
 ) -> tuple[int, int, int]:
     """convert_jobs와 encoding_fix_jobs를 실제로 실행한다.
 
-    smi -> srt/ass 변환은 그냥 포맷만 바꾸는 게 아니라, LLM 서버를 띄워 각 문장을 AI로
+    verify_with_ai=True이면 LLM 서버를 띄워 각 문장을 AI로
     검수한다(core.translate.verify_cues) — 인코딩 오류로 깨진 글자를 문맥 보고 복원하되
-    번역/의역은 하지 않는다. 그래서 변환 단계가 번역만큼은 아니어도 시간이 좀 걸린다.
+    번역/의역은 하지 않는다. False이면 모델을 실행하지 않고 형식만 빠르게 변환한다.
     인코딩만 고치는 encoding_fix_jobs는 AI 없이 바로 처리한다.
 
     반환값: (변환 성공 수, 인코딩 수정 수, 삭제한 smi 수)
@@ -113,6 +147,9 @@ def run_conversions(
         "ass": config.get("subtitle.ass_encoding", "utf-8-sig"),
         "smi": config.get("subtitle.smi_encoding", "utf-8-sig"),
     }
+    conversion_formats = [fmt for fmt in formats if fmt in ("srt", "ass")]
+    if plan.convert_jobs and not conversion_formats:
+        raise ValueError("SMI 변환에는 SRT 또는 ASS 출력 형식이 필요합니다.")
     target_lang = config.get("target_language", "ko")
     converted = 0
     deleted = 0
@@ -133,16 +170,18 @@ def run_conversions(
             n_gpu_layers=config.get("llm.n_gpu_layers", 999),
             ctx_size=config.get("llm.ctx_size", 8192),
             log_path=log_dir / "llama-server.log",
-        )
-        if progress_cb:
+        ) if verify_with_ai else None
+        if progress_cb and server is not None:
             progress_cb("LLM 서버 시작 중 (기존 자막 검수용)")
-        server.start()
+        if server is not None:
+            server.start()
         try:
             for k, job in enumerate(plan.convert_jobs, 1):
                 if cancel_check is not None and cancel_check():
                     raise PipelineCancelled()
                 if progress_cb:
-                    progress_cb(f"[smi 변환+검수 {k}/{n_convert}] {job.video.name}")
+                    stage = "smi 변환+검수" if verify_with_ai else "smi 변환"
+                    progress_cb(f"[{stage} {k}/{n_convert}] {job.video.name}")
                 try:
                     parsed = parse_smi(job.smi_path)
                     if not parsed:
@@ -151,22 +190,26 @@ def run_conversions(
                     cue_objs = [
                         Cue(id=idx, start=c.start, end=c.end, text=c.text) for idx, c in enumerate(parsed)
                     ]
-                    corrected, _vreport = verify_cues(
-                        cue_objs, server, config, target_lang=target_lang, cancel_check=cancel_check
-                    )
+                    corrected = {}
+                    _vreport = None
+                    if server is not None:
+                        corrected, _vreport = verify_cues(
+                            cue_objs, server, config, target_lang=target_lang, cancel_check=cancel_check
+                        )
                     final_cues = [
                         DisplayCue(start=c.start, end=c.end, text=corrected.get(c.id, c.text)) for c in cue_objs
                     ]
                     lang = extract_lang_suffix(job.smi_path, job.video.stem) or target_lang
                     job.written = write_cues_as(
-                        final_cues, job.smi_path.parent, formats, job.video.stem, lang, encodings
+                        final_cues, job.smi_path.parent, conversion_formats, job.video.stem, lang, encodings
                     )
                     converted += 1
                     if worklog:
                         worklog.event(
                             "smi 변환", job.smi_path.name, "완료",
                             f"{', '.join(w.name for w in job.written)} 생성, {len(final_cues)}줄, "
-                            f"AI 검수 후 원문 유지 {len(_vreport.failed_ids)}줄",
+                            f"AI 검수 후 원문 유지 {len(_vreport.failed_ids)}줄" if _vreport else
+                            f"{', '.join(w.name for w in job.written)} 생성, {len(final_cues)}줄, 형식만 변환(AI 검수 없음)",
                         )
                     written_ok = bool(job.written) and all(w.exists() and w.stat().st_size > 0 for w in job.written)
                     if delete_old_smi and not written_ok:
@@ -186,7 +229,8 @@ def run_conversions(
                     if worklog:
                         worklog.event("smi 변환", job.smi_path.name, "실패", job.error.splitlines()[0][:200] if job.error else "")
         finally:
-            server.stop()
+            if server is not None:
+                server.stop()
 
     fixed = 0
     for k, job in enumerate(plan.encoding_fix_jobs, 1):

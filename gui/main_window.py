@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QDialog,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -37,20 +38,18 @@ from PySide6.QtWidgets import (
 )
 
 from core.config import Config, DEFAULT_CONFIG_PATH
-from core.folder_scan import plan_folder
 from core.pipeline import predict_output_paths
 from core.setup_assets import list_missing
 from core.worklog import LOG_FILENAME
 from gui.asset_worker import AssetDownloadWorker
 from gui.folder_worker import FolderCleanupWorker
+from gui.folder_picker import FolderPickerDialog, VIDEO_EXTENSIONS
 from gui.progress_model import EtaEstimator, StageTracker, format_duration, format_remaining
 from gui.worker import PipelineWorker
 
 from gui.theme import STYLE_SHEET
 
 # 진행 메시지 형식: "[단계 k/N] 파일명" (core/pipeline.py, core/folder_scan.py 에서 만든다)
-
-VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".ts", ".webm", ".m4v", ".flv"}
 
 LANGUAGES = [
     ("일본어", "ja"),
@@ -158,8 +157,8 @@ class MainWindow(QMainWindow):
         add_btn.clicked.connect(self._on_add_files)
         add_folder_btn = QPushButton("폴더 추가...")
         add_folder_btn.setToolTip(
-            "폴더 안의 영상을 전부 훑어봅니다. 예전 smi 자막은 srt/ass로 변환하고,\n"
-            "인코딩이 깨질 수 있는 자막은 고치고, 자막이 아예 없는 영상만 목록에 추가합니다."
+            "폴더를 검색한 뒤, 처리할 파일과 작업을 직접 선택합니다.\n"
+            "검색만으로 변환이나 AI 작업이 시작되지 않습니다."
         )
         add_folder_btn.clicked.connect(self._on_add_folder)
         remove_btn = QPushButton("선택 제거")
@@ -173,10 +172,9 @@ class MainWindow(QMainWindow):
         btn_row.addStretch(1)
         v.addLayout(btn_row)
 
-        self.delete_smi_chk = QCheckBox("폴더 추가 시 smi를 srt/ass로 변환한 뒤 원본 smi 삭제")
-        self.delete_smi_chk.setChecked(False)
-        self.delete_smi_chk.setToolTip("체크 안 하면 변환 후에도 원본 smi 파일을 그대로 남겨둡니다.")
-        v.addWidget(self.delete_smi_chk)
+        folder_hint = QLabel("폴더 추가 후 원하는 파일만 선택할 수 있어요.")
+        folder_hint.setObjectName("muted")
+        v.addWidget(folder_hint)
         return box
 
     def _build_output_section(self) -> QGroupBox:
@@ -469,88 +467,64 @@ class MainWindow(QMainWindow):
         if not folder:
             return
 
-        found = sorted(
-            p for p in Path(folder).rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
-        )
-        if not found:
-            QMessageBox.information(self, "영상 없음", "선택한 폴더(하위 폴더 포함)에서 영상 파일을 찾지 못했습니다.")
-            return
-
         config = self._build_config()
-        formats = self._selected_formats()
-        plan = plan_folder(found, out_dir, config)
-
-        if not plan.convert_jobs and not plan.encoding_fix_jobs:
-            self._add_files([str(v) for v in plan.generate])
-            self._show_results(self._folder_result_rows(plan))
-            QMessageBox.information(
-                self, "폴더 추가 완료", f"영상 {len(found)}개 중 자막 없는 {len(plan.generate)}개를 목록에 추가했습니다."
-            )
+        picker = FolderPickerDialog(folder, out_dir, config, self)
+        if picker.exec() != QDialog.Accepted:
+            picker.deleteLater()
+            return
+        plan = picker.selected_plan()
+        verify_with_ai = picker.ai_chk.isChecked()
+        delete_old_smi = picker.delete_chk.isChecked()
+        picker.deleteLater()
+        # Conversion must produce a different format; an SMI-only selection
+        # would rewrite the input instead of converting it.
+        formats = [fmt for fmt in self._selected_formats() if fmt != "smi"]
+        if plan.convert_jobs and not formats:
+            QMessageBox.warning(self, "변환 형식 선택", "SMI를 변환하려면 기본 옵션에서 SRT 또는 ASS를 선택해 주세요.")
             return
 
-        details = []
-        if plan.convert_jobs:
-            details.append(f"- 예전 smi 자막 {len(plan.convert_jobs)}개를 {'/'.join(formats)}로 변환")
-        if plan.encoding_fix_jobs:
-            details.append(f"- 인코딩이 깨질 수 있는 자막 {len(plan.encoding_fix_jobs)}개를 BOM UTF-8로 재저장")
-        if plan.generate:
-            details.append(f"- 자막이 아예 없는 영상 {len(plan.generate)}개는 목록에 추가(AI로 새로 생성)")
-        note = ""
-        if plan.convert_jobs:
-            note = "\n\n(smi 변환은 AI로 글자를 검수하느라 번역만큼은 아니어도 시간이 걸립니다. " \
-                   "기존 smi 파일은 '변환 후 smi 삭제' 체크 여부에 따라 지워집니다)"
-        reply = QMessageBox.question(
-            self, "폴더 정리 확인", "다음 작업을 진행할까요?\n\n" + "\n".join(details) + note,
-            QMessageBox.Yes | QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
-            return
-
-        if plan.convert_jobs:
-            # smi 변환의 AI 검수는 범용 모델(Qwen)을 쓴다. 없으면 먼저 받을지 물어본다.
-            verify_missing = [t for t in list_missing(config, include_verify_model=True) if "Qwen" in t.label]
-            if verify_missing:
+        if plan.convert_jobs and verify_with_ai:
+            missing = [t for t in list_missing(config, include_verify_model=True)
+                       if "Qwen" in t.label or "llama.cpp" in t.label]
+            if missing:
+                names = "\n".join(f"- {t.label}" for t in missing)
                 ask = QMessageBox.question(
-                    self,
-                    "AI 검수 모델 필요",
-                    "smi를 AI로 검수하며 변환하려면 범용 AI 모델(Qwen3-8B, 약 4.7GB)이 필요합니다. 지금 받을까요?",
+                    self, "AI 검수 준비", f"선택한 SMI의 AI 검수에 필요한 파일을 받을까요?\n\n{names}",
                     QMessageBox.Yes | QMessageBox.No,
                 )
-                if ask != QMessageBox.Yes or not self._run_asset_download(verify_missing):
+                if ask != QMessageBox.Yes or not self._run_asset_download(missing):
                     return
 
-        converted, fixed, deleted = self._run_folder_cleanup(plan, formats, config, self.delete_smi_chk.isChecked())
+        self._add_files([str(video) for video in plan.generate])
+        if not plan.convert_jobs and not plan.encoding_fix_jobs:
+            self._show_results(self._folder_result_rows(plan))
+            self.status_label.setText(f"선택한 영상 {len(plan.generate)}개를 담았습니다. 시작 버튼을 눌러 자막을 생성하세요.")
+            return
+
+        converted, fixed, deleted = self._run_folder_cleanup(
+            plan, formats, config, delete_old_smi, verify_with_ai=verify_with_ai,
+        )
         self._show_results(self._folder_result_rows(plan))
         self._refresh_counts()
         if converted is None:
-            return  # 취소/실패 — 이미 안내 메시지 띄움
-
-        failed_convert = [j for j in plan.convert_jobs if j.error]
-        failed_fix = [j for j in plan.encoding_fix_jobs if j.error]
-
-        self._add_files([str(v) for v in plan.generate])
-
-        msg_lines = [f"영상 {len(found)}개를 확인했습니다."]
-        if converted:
-            msg_lines.append(f"smi {converted}개를 AI 검수 후 {'/'.join(formats)}로 변환했습니다.")
-        if deleted:
-            msg_lines.append(f"변환 후 원본 smi {deleted}개를 삭제했습니다.")
-        if fixed:
-            msg_lines.append(f"인코딩 {fixed}개를 BOM UTF-8로 고쳤습니다.")
+            return
+        failed = sum(bool(job.error) for job in [*plan.convert_jobs, *plan.encoding_fix_jobs])
+        message = f"선택한 작업 완료 · SMI 변환 {converted}개 / 인코딩 수정 {fixed}개"
         if plan.generate:
-            msg_lines.append(f"자막 없는 {len(plan.generate)}개를 목록에 추가했습니다.")
-        else:
-            msg_lines.append("새로 생성할 영상은 없습니다.")
-        if failed_convert or failed_fix:
-            msg_lines.append(f"실패: 변환 {len(failed_convert)}개, 인코딩 수정 {len(failed_fix)}개 (로그 참고)")
-        QMessageBox.information(self, "폴더 정리 완료", "\n".join(msg_lines))
+            message += f"\n새 자막을 만들 영상 {len(plan.generate)}개는 대기열에 담았습니다. 시작 버튼을 눌러 실행하세요."
+        if deleted:
+            message += f"\n변환에 성공한 원본 SMI {deleted}개를 삭제했습니다."
+        if failed:
+            message += f"\n실패 {failed}개 · 결과 탭에서 확인하세요."
+        QMessageBox.information(self, "선택한 작업 완료", message)
 
-    def _run_folder_cleanup(self, plan, formats, config, delete_old_smi: bool):
+    def _run_folder_cleanup(self, plan, formats, config, delete_old_smi: bool, verify_with_ai: bool = True):
         """FolderCleanupWorker를 돌리며 진행 다이얼로그를 보여준다.
         성공하면 (converted, fixed, deleted), 취소/실패면 (None, None, None)."""
         total = len(plan.convert_jobs) + len(plan.encoding_fix_jobs)
         self.tracker.reset()
-        self.tracker.set_expected("smi 변환+검수", len(plan.convert_jobs))
+        conversion_stage = "smi 변환+검수" if verify_with_ai else "smi 변환"
+        self.tracker.set_expected(conversion_stage, len(plan.convert_jobs))
         self.tracker.set_expected("인코딩 수정", len(plan.encoding_fix_jobs))
         dlg = QProgressDialog("폴더를 정리하는 중...", "취소", 0, max(total, 1), self)
         dlg.setWindowTitle("폴더 정리")
@@ -560,11 +534,12 @@ class MainWindow(QMainWindow):
         dlg.setAutoReset(False)
         dlg.setMinimumWidth(420)
 
-        worker = FolderCleanupWorker(plan, formats, config, delete_old_smi, self.out_dir_edit.text().strip())
+        worker = FolderCleanupWorker(plan, formats, config, delete_old_smi, self.out_dir_edit.text().strip(),
+                                     verify_with_ai=verify_with_ai)
         loop = QEventLoop()
         result = {"ok": None}
 
-        stages = ("smi 변환+검수", "인코딩 수정")
+        stages = (conversion_stage, "인코딩 수정")
 
         def on_progress(message: str) -> None:
             self.tracker.update(message)

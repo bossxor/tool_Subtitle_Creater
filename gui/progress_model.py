@@ -67,8 +67,10 @@ class StageTracker:
 
     def lines(self) -> list[str]:
         out: list[str] = []
-        if SMI_STAGE in self.order:
-            d, t = self.done.get(SMI_STAGE, 0), self.totals.get(SMI_STAGE, 0)
+        smi_stages = [s for s in (SMI_STAGE, "smi 변환") if s in self.order]
+        if smi_stages:
+            d = sum(self.done.get(s, 0) for s in smi_stages)
+            t = sum(self.totals.get(s, 0) for s in smi_stages)
             out.append(f"smi 변환: {t}개 중 {d}개 완료")
         if ENCODING_STAGE in self.order:
             d, t = self.done.get(ENCODING_STAGE, 0), self.totals.get(ENCODING_STAGE, 0)

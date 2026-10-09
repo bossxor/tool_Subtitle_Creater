@@ -15,7 +15,8 @@ class FolderCleanupWorker(QThread):
     failed = Signal(str)
 
     def __init__(
-        self, plan: FolderScanPlan, formats: list[str], config, delete_old_smi: bool, out_dir: str = "", parent=None
+        self, plan: FolderScanPlan, formats: list[str], config, delete_old_smi: bool, out_dir: str = "", parent=None,
+        verify_with_ai: bool = True,
     ):
         super().__init__(parent)
         self.out_dir = out_dir
@@ -23,6 +24,7 @@ class FolderCleanupWorker(QThread):
         self.formats = formats
         self.config = config
         self.delete_old_smi = delete_old_smi
+        self.verify_with_ai = verify_with_ai
         self._cancel_requested = False
 
     def request_cancel(self) -> None:
@@ -37,6 +39,7 @@ class FolderCleanupWorker(QThread):
                     f"smi 변환 {len(self.plan.convert_jobs)}개, 인코딩 수정 {len(self.plan.encoding_fix_jobs)}개, "
                     f"자막 없어서 새로 만들 영상 {len(self.plan.generate)}개",
                     f"자막 형식: {'/'.join(self.formats)}, 변환 후 원본 smi 삭제: {'예' if self.delete_old_smi else '아니오'}",
+                    f"SMI AI 검수: {'예' if self.verify_with_ai else '아니오(형식만 변환)'}",
                     *[f"  새로 만들 영상: {v}" for v in self.plan.generate[:50]],
                 ],
             )
@@ -49,6 +52,7 @@ class FolderCleanupWorker(QThread):
                 progress_cb=self.progress.emit,
                 cancel_check=lambda: self._cancel_requested,
                 worklog=worklog,
+                verify_with_ai=self.verify_with_ai,
             )
             if worklog:
                 worklog.end(f"폴더 정리 끝 - 변환 {converted}개, 인코딩 수정 {fixed}개, 원본 smi 삭제 {deleted}개")
