@@ -22,13 +22,13 @@
 
 ```
 영상 ─ ffmpeg(오디오 추출) ─ faster-whisper large-v3-turbo(GPU) ─ 문장 단위로 재분할
-     ─ Qwen3-8B Q4 (llama.cpp CUDA)로 번역+다듬기 ─ 검증/재시도 ─ srt(+ass/smi) 저장
+     ─ TranslateGemma 12B (llama.cpp CUDA)로 줄 단위 번역 ─ 검증/재시도 ─ srt(+ass/smi) 저장
 ```
 
 - **음성 인식**: [faster-whisper](https://github.com/SYSTRAN/faster-whisper) `large-v3-turbo`, 배치 추론 + VAD
-- **번역**: [Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B-GGUF) (Q4_K_M)를 [llama.cpp](https://github.com/ggml-org/llama.cpp) 서버로 실행, thinking 모드 끔
+- **번역**: 번역 전용 모델 [TranslateGemma 12B](https://huggingface.co/mradermacher/translategemma-12b-it-GGUF) (IQ4_XS, 6.6GB)를 [llama.cpp](https://github.com/ggml-org/llama.cpp) 서버로 실행. 일본어 문장 끝으로 반말/존댓말을 판별해 반말일 때 지시를 줍니다. 범용 모델(Qwen3-8B)은 smi 변환의 AI 검수에 씁니다.
 - **타임스탬프는 코드가 관리**하고 LLM에는 텍스트만 전달해서 싱크가 어긋나지 않게 했습니다.
-- 번역 결과에 한자·가나가 한글로 안 바뀌고 남는 경우를 정규식으로 잡아 해당 문장만 재번역합니다.
+- 번역 결과에 한자·가나가 한글로 안 바뀌고 남거나 원문에 없는 영어가 섞이면 해당 줄만 다시 번역하고, 끝내 안 되면 한글 음역 또는 원문 유지로 처리하며 작업 로그에 남깁니다.
 
 자세한 설계 근거와 실측 수치는 [`DESIGN.md`](DESIGN.md)에 있습니다.
 
@@ -37,9 +37,11 @@
 | 단계 | 결과 |
 |---|---|
 | 음성 인식 (large-v3-turbo) | 약 91배속 (10분 오디오 → 약 7초) |
-| 번역 (Qwen3-8B Q4) | 초당 약 2.8문장 (1시간 영상 약 4~5분 예상) |
+| 번역 (TranslateGemma 12B IQ4_XS, 4개 병렬) | 40줄에 약 20~24초 (1시간 영상 약 7분 예상) |
 
-> 위 수치는 CC0 일본어 **낭독** 샘플로 잰 값입니다. 배경음악·겹치는 대사가 있는 실제 드라마에서는 달라질 수 있습니다.
+> 음성 인식 수치는 CC0 일본어 **낭독** 샘플로 잰 값입니다. 배경음악·겹치는 대사가 있는 실제 드라마에서는 달라질 수 있습니다.
+>
+> **번역 정확도**: 일상 대사 40줄(제가 기준 번역을 쓰고 채점한 소규모 평가)에서 뜻이 틀린 줄이 Qwen3-8B는 약 10줄, TranslateGemma 12B는 1~4줄이었습니다. 음성 인식 오류는 이 평가에 포함되지 않았습니다. 자세한 내용은 [`DESIGN.md`](DESIGN.md)를 참고하세요.
 
 ## 요구 사항
 
@@ -47,7 +49,8 @@
 - NVIDIA GPU (VRAM 8GB 이상 권장) + 최신 드라이버
 - **ffmpeg**가 PATH에 있어야 합니다 (`winget install Gyan.FFmpeg`)
 - Python 3.11 (소스로 실행/빌드할 때)
-- 첫 실행 때 필요한 모델·런타임을 자동으로 내려받습니다 (기본 설정 기준 약 6~7GB: 음성 인식 모델 + 번역 모델 + llama.cpp)
+- 첫 실행 때 필요한 모델·런타임을 자동으로 내려받습니다 (기본 설정 기준 약 8~9GB: 음성 인식 모델 + 번역 모델 6.6GB + llama.cpp). smi를 AI로 검수하며 변환할 때만 Qwen3-8B(4.7GB)를 추가로 받습니다.
+- 번역 모델은 Gemma 이용 약관(license: gemma)의 적용을 받습니다.
 
 ## 실행 방법
 

@@ -508,6 +508,19 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
+        if plan.convert_jobs:
+            # smi 변환의 AI 검수는 범용 모델(Qwen)을 쓴다. 없으면 먼저 받을지 물어본다.
+            verify_missing = [t for t in list_missing(config, include_verify_model=True) if "Qwen" in t.label]
+            if verify_missing:
+                ask = QMessageBox.question(
+                    self,
+                    "AI 검수 모델 필요",
+                    "smi를 AI로 검수하며 변환하려면 범용 AI 모델(Qwen3-8B, 약 4.7GB)이 필요합니다. 지금 받을까요?",
+                    QMessageBox.Yes | QMessageBox.No,
+                )
+                if ask != QMessageBox.Yes or not self._run_asset_download(verify_missing):
+                    return
+
         converted, fixed, deleted = self._run_folder_cleanup(plan, formats, config, self.delete_smi_chk.isChecked())
         self._show_results(self._folder_result_rows(plan))
         self._refresh_counts()

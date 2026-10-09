@@ -115,3 +115,35 @@ def kana_to_hangul(text: str) -> str:
             out.append(c)
         i += 1
     return "".join(out)
+
+
+# ---- 일본어 말투 판별 (번역 모델에 존댓말/반말 지시를 줄 때 쓴다) ----
+_POLITE_RE = re.compile(
+    r"(です|ます|ません|でした|ました|ましょう|ください|下さい|ございま|いたし|おります|でしょう"
+    r"|^ええ|^はい|すみません|申し訳|失礼|恐れ入|お疲れ様|よろしくお願)"
+)
+_CASUAL_ANYWHERE_RE = re.compile(r"(お前|てめえ|おまえ|あんた|おい|俺|おれ|あたし|うん|ううん|ごめん|悪い|やだ|まじ|やばい|ねえ|なあ|じゃん)")
+_CASUAL_END_RE = re.compile(
+    r"(だ|だよ|だね|だろ|だぞ|だぜ|だわ|だって|だっけ|かよ|かな|かい|かしら|っけ|よ|ね|ぞ|ぜ|わ|な|さ|のよ|のね|んだ"
+    r"|ない|なきゃ|なくちゃ|ちゃう|ちゃった|ちゃって|てよ|てね|て|ろ|れ|る|う|く|ぐ|す|つ|ぬ|ぶ|む|い|た|か|たら)$"
+)
+_END_STRIP_RE = re.compile(r"[\s、。！？!?…・〜~]+$")
+_SENTENCE_SPLIT_RE = re.compile(r"[。！？!?…]+")
+
+
+def japanese_register(text: str) -> str | None:
+    """'polite'(존댓말), 'casual'(반말), 또는 확실치 않으면 None.
+
+    문장 끝/표지로만 판단하는 규칙이라 틀릴 수 있다. 그래서 애매한 짧은 인사말 같은 건 None으로 두고
+    모델 기본값에 맡긴다(잘못된 지시를 주는 것보다 안전). 한 줄에 문장이 여러 개면 문장마다 끝을 본다.
+    """
+    t = text.strip()
+    if _POLITE_RE.search(t):
+        return "polite"
+    if _CASUAL_ANYWHERE_RE.search(t):
+        return "casual"
+    for seg in _SENTENCE_SPLIT_RE.split(t):
+        seg = _END_STRIP_RE.sub("", seg.strip())
+        if len(seg) > 4 and _CASUAL_END_RE.search(seg):
+            return "casual"
+    return None

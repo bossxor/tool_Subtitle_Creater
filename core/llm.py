@@ -28,6 +28,7 @@ class LlamaServer:
         n_gpu_layers: int = 999,
         ctx_size: int = 8192,
         log_path: Optional[Path] = None,
+        extra_args: Optional[list[str]] = None,
     ):
         self.server_exe = Path(server_exe)
         self.model_path = Path(model_path)
@@ -35,6 +36,7 @@ class LlamaServer:
         self.n_gpu_layers = n_gpu_layers
         self.ctx_size = ctx_size
         self.log_path = Path(log_path) if log_path else None
+        self.extra_args = list(extra_args or [])  # 예: ["--no-jinja"]
         self.proc: Optional[subprocess.Popen] = None
         self._log_file = None  # 서버 로그를 받는 파일 핸들. stop()에서 닫지 않으면 파일이 계속 잠긴다
 
@@ -68,6 +70,7 @@ class LlamaServer:
             str(self.ctx_size),
             "--port",
             str(self.port),
+            *self.extra_args,
         ]
         self._log_file = open(self.log_path, "w", encoding="utf-8") if self.log_path else None
         self.proc = subprocess.Popen(
@@ -109,6 +112,28 @@ class LlamaServer:
             except OSError:
                 pass
             self._log_file = None
+
+    def complete(
+        self,
+        prompt: str,
+        temperature: float = 0.1,
+        n_predict: int = 300,
+        stop: Optional[list[str]] = None,
+        timeout: float = 300.0,
+    ) -> str:
+        """채팅 템플릿 없이 완성된 프롬프트 문자열을 그대로 보내 이어 쓰게 한다 (TranslateGemma용)."""
+        r = requests.post(
+            f"{self.base_url}/completion",
+            json={
+                "prompt": prompt,
+                "n_predict": n_predict,
+                "temperature": temperature,
+                "stop": stop or ["<end_of_turn>"],
+            },
+            timeout=timeout,
+        )
+        r.raise_for_status()
+        return r.json()["content"].strip()
 
     def chat(
         self,

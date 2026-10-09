@@ -18,6 +18,16 @@ stt:
 
 llm:
   server_exe: tools/llama.cpp/llama-server.exe
+  # 번역 백엔드: translategemma = 번역 전용 모델(기본, 정확도 높음) / json = 범용 채팅 모델(Qwen3)로 JSON 배치 번역
+  # 평가용 일본어 대사 40줄에서 뜻이 틀린 줄: Qwen3-8B 약 10줄 -> TranslateGemma 12B 1~4줄
+  translate_backend: translategemma
+  translate_model: models/llm/translategemma-12b-it.IQ4_XS.gguf
+  translate_port: 8092
+  translate_ctx_size: 4096
+  translate_extra_args: ["--no-jinja"]   # 이 모델의 특수 채팅 템플릿을 서버가 못 읽어서 끈다(직접 프롬프트를 만들어 보냄)
+  translate_parallel: 4                  # 줄 단위 번역을 동시에 보내는 개수
+  translate_temperature: 0.1
+  # 아래는 Qwen3(범용 모델): json 백엔드와, smi 변환 때 AI가 깨진 글자를 검수할 때 쓴다
   model: models/llm/Qwen3-8B-Q4_K_M.gguf
   port: 8090
   n_gpu_layers: 999

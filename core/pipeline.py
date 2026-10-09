@@ -20,6 +20,7 @@ from core.llm import LlamaServer
 from core.segmenter import Cue, build_cues, cues_from_json, cues_to_json
 from core.stt import STTEngine, words_from_json, words_to_json
 from core.translate import translate_cues
+from core.translate_gemma import translate_cues_gemma
 from core.worklog import WorkLog
 from core.writers import build_display_cues, write_ass, write_smi, write_srt
 
@@ -199,6 +200,32 @@ def stage_segment(
     return results
 
 
+def _start_server_with_fallback(config, model_path: Path, port: int, ctx: int, extra_args, log_path: Path) -> LlamaServer:
+    """GPU 메모리가 모자라 서버가 못 뜨면 GPU에 올리는 층 수를 줄여서 다시 시도한다 (느려지지만 동작)."""
+    first = config.get("llm.n_gpu_layers", 999)
+    last_error: Exception | None = None
+    for ngl in dict.fromkeys([first, 36, 24, 0]):
+        server = LlamaServer(
+            server_exe=config.resolve_path("llm.server_exe"),
+            model_path=model_path,
+            port=port,
+            n_gpu_layers=ngl,
+            ctx_size=ctx,
+            log_path=log_path,
+            extra_args=extra_args,
+        )
+        try:
+            server.start()
+            if ngl != first:
+                logger.warning("GPU 메모리 부족으로 GPU 층 수를 %s로 낮춰 번역 서버를 시작함 (느려질 수 있음)", ngl)
+            return server
+        except Exception as e:  # noqa: BLE001
+            last_error = e
+            server.stop()
+            logger.warning("번역 서버 시작 실패(GPU 층 %s): %s", ngl, str(e).splitlines()[0])
+    raise last_error  # type: ignore[misc]
+
+
 def stage_translate(
     videos: list[Path],
     cues_map: dict[Path, list[Cue]],
@@ -242,16 +269,21 @@ def stage_translate(
     _check_cancel(cancel_check)
     log_dir = config.resolve_path("paths.cache_dir", "cache")
     log_dir.mkdir(parents=True, exist_ok=True)
-    server = LlamaServer(
-        server_exe=config.resolve_path("llm.server_exe"),
-        model_path=config.resolve_path("llm.model"),
-        port=config.get("llm.port", 8090),
-        n_gpu_layers=config.get("llm.n_gpu_layers", 999),
-        ctx_size=config.get("llm.ctx_size", 8192),
-        log_path=log_dir / "llama-server.log",
-    )
-    _report(progress_cb, f"LLM 서버 시작 중 ({config.resolve_path('llm.model').name})")
-    server.start()
+    use_gemma = config.get("llm.translate_backend", "translategemma") == "translategemma"
+    if use_gemma:
+        model_path = config.resolve_path("llm.translate_model")
+        port = config.get("llm.translate_port", 8092)  # Qwen 서버(8090)와 포트를 나눠서 서로 안 섞이게 한다
+        ctx = config.get("llm.translate_ctx_size", 4096)
+        extra_args = config.get("llm.translate_extra_args", ["--no-jinja"])
+        translate_fn = translate_cues_gemma
+    else:
+        model_path = config.resolve_path("llm.model")
+        port = config.get("llm.port", 8090)
+        ctx = config.get("llm.ctx_size", 8192)
+        extra_args = []
+        translate_fn = translate_cues
+    _report(progress_cb, f"번역 모델 시작 중 ({model_path.name})")
+    server = _start_server_with_fallback(config, model_path, port, ctx, extra_args, log_dir / "llama-server.log")
     try:
         batch_size = config.get("llm.batch_sentences", 25)
         for i, v in enumerate(pending, 1):
@@ -263,7 +295,7 @@ def stage_translate(
             per_batch_weight = translate_weight / n_batches
             on_batch_done = (lambda w=per_batch_weight: tracker.add(w)) if tracker else None
 
-            ko_map, report = translate_cues(
+            ko_map, report = translate_fn(
                 cues_map[v],
                 server,
                 config,

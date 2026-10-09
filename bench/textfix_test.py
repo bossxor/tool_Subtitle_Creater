@@ -84,3 +84,61 @@ with tempfile.TemporaryDirectory() as tmp:
     assert plan.convert_jobs[0].error, "실패로 기록되지 않음"
 
 print("작업 로그/안전성 테스트 통과")
+
+# ---- 말투 판별 / TranslateGemma 백엔드 (가짜 LLM, GPU 불필요) ----
+from core.segmenter import Cue  # noqa: E402
+from core.textfix import japanese_register  # noqa: E402
+from core.translate_gemma import build_prompt, translate_cues_gemma  # noqa: E402
+
+check("register polite", japanese_register("課長はもう来てますか？"), "polite")
+check("register casual", japanese_register("悪い悪い。電車が止まっちゃってさ。"), "casual")
+check("register multi-sentence", japanese_register("ご飯できてるよ。先に食べる？それともお風呂？"), "casual")
+check("register greeting is undecided", japanese_register("ただいま。"), None)
+check("register ええ is polite", japanese_register("ええ、朝から会議があるので。"), "polite")
+
+pr = build_prompt("やあ", "ja", "ko", "Translate into informal Korean (반말).")
+assert pr.startswith("<start_of_turn>user\n") and pr.endswith("<start_of_turn>model\n"), "Gemma 턴 형식이 아님"
+assert "Japanese (ja) to Korean (ko) translator" in pr and pr.rstrip().endswith("やあ<end_of_turn>\n<start_of_turn>model".rstrip())
+
+
+class FakeLLM:
+    """complete()가 프롬프트에 따라 정해진 답을 돌려주는 가짜 서버. 호출 기록도 남긴다."""
+
+    def __init__(self, answers):
+        self.answers, self.calls = answers, []
+
+    def complete(self, prompt, temperature=0.1, n_predict=300, stop=None, timeout=300):
+        self.calls.append((prompt, temperature))
+        text = prompt.split("\n\n\n", 1)[1].rsplit("<end_of_turn>", 1)[0]
+        ans = self.answers[text]
+        return ans.pop(0) if isinstance(ans, list) else ans
+
+
+cfg = Config.load(DEFAULT_CONFIG_PATH)
+cues = [
+    Cue(id=0, start=0, end=1, text="おはよう"),          # 정상
+    Cue(id=1, start=1, end=2, text="あっ"),              # 가나만: 계속 가나로 답하면 음역 폴백
+    Cue(id=2, start=2, end=3, text="帰り道"),            # 한자 섞임: 끝내 실패하면 원문 유지
+    Cue(id=3, start=3, end=4, text="行こう"),            # 첫 시도엔 일본 문자가 남고 재시도에서 성공
+    Cue(id=4, start=4, end=5, text="いいね"),            # 원문에 없는 영어가 섞이면 재시도
+]
+fake = FakeLLM({
+    "おはよう": "안녕",
+    "あっ": "あっ",
+    "帰り道": "帰り道",
+    "行こう": ["行こう", "가자"],
+    "いいね": ["good 좋다", "좋다"],
+})
+out, rep = translate_cues_gemma(cues, fake, cfg, cancel_check=None)
+check("normal", out[0], "안녕")
+check("kana-only falls back to hangul", out[1], "앗")
+check("kanji line keeps source", out[2], "帰り道")
+check("retry fixes leaked kana", out[3], "가자")
+check("retry fixes stray english", out[4], "좋다")
+check("report transliterated", rep.transliterated_ids, [1])
+check("report failed", rep.failed_ids, [2])
+temps = [t for p, t in fake.calls if p.endswith("行こう<end_of_turn>\n<start_of_turn>model\n")]
+assert len(temps) == 2 and temps[1] > temps[0], f"재시도에서 온도가 안 올라감: {temps}"
+assert any("Do not use these characters" in p for p, _ in fake.calls), "재시도에 avoid 힌트가 없음"
+
+print("말투/TranslateGemma 백엔드 테스트 통과")

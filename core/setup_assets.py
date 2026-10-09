@@ -37,6 +37,10 @@ LLAMA_CPP_ASSETS = [
 LLM_REPO = "Qwen/Qwen3-8B-GGUF"
 LLM_FILE = "Qwen3-8B-Q4_K_M.gguf"
 
+# 번역 전용 모델 (기본 번역 백엔드). 6.6GB, GPU 8GB에 올라가는 4비트 양자화본
+TRANSLATE_REPO = "mradermacher/translategemma-12b-it-GGUF"
+TRANSLATE_FILE = "translategemma-12b-it.IQ4_XS.gguf"
+
 
 @dataclass
 class AssetTask:
@@ -102,8 +106,19 @@ def _fetch_llm(out_dir: Path) -> Callable[[ProgressCB], None]:
     return _fetch
 
 
-def list_missing(config) -> list[AssetTask]:
-    """현재 설정(config)이 실제로 필요로 하는 것 중 아직 없는 항목만 반환한다."""
+def _fetch_translate_model(out_dir: Path) -> Callable[[ProgressCB], None]:
+    def _fetch(progress_cb: ProgressCB) -> None:
+        dest = out_dir / TRANSLATE_FILE
+        _download_file(_hf_url(TRANSLATE_REPO, TRANSLATE_FILE), dest, f"번역 모델: {TRANSLATE_FILE}", progress_cb)
+
+    return _fetch
+
+
+def list_missing(config, include_verify_model: bool = False) -> list[AssetTask]:
+    """현재 설정(config)이 실제로 필요로 하는 것 중 아직 없는 항목만 반환한다.
+
+    include_verify_model: smi 변환 때 AI 검수에 쓰는 Qwen 모델까지 확인할지(기본은 번역에 필요한 것만).
+    """
     tasks: list[AssetTask] = []
 
     precision = config.get("stt.precision", "turbo")
@@ -128,11 +143,24 @@ def list_missing(config) -> list[AssetTask]:
             )
         )
 
+    use_gemma = config.get("llm.translate_backend", "translategemma") == "translategemma"
+    if use_gemma:
+        translate_model = config.resolve_path("llm.translate_model")
+        if not translate_model.exists():
+            tasks.append(
+                AssetTask(
+                    label="번역 모델 (TranslateGemma 12B, 6.6GB)",
+                    check_path=translate_model,
+                    fetch=_fetch_translate_model(translate_model.parent),
+                )
+            )
+
+    # Qwen: json 백엔드의 번역 모델이거나, smi 변환의 AI 검수 모델
     llm_model = config.resolve_path("llm.model")
-    if not llm_model.exists():
+    if (not use_gemma or include_verify_model) and not llm_model.exists():
         tasks.append(
             AssetTask(
-                label="번역 모델 (Qwen3-8B)",
+                label="범용 AI 모델 (Qwen3-8B, 4.7GB)",
                 check_path=llm_model,
                 fetch=_fetch_llm(llm_model.parent),
             )
