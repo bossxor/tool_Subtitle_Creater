@@ -17,6 +17,7 @@ from core.errors import PipelineCancelled
 from core.llm import LlamaServer
 from core.segmenter import Cue
 from core.translate import verify_cues
+from core.worklog import WorkLog
 from core.writers import DisplayCue
 
 SUB_EXTS = ("srt", "ass", "smi")
@@ -96,6 +97,7 @@ def run_conversions(
     delete_old_smi: bool,
     progress_cb=None,
     cancel_check=None,
+    worklog: WorkLog | None = None,
 ) -> tuple[int, int, int]:
     """convert_jobs와 encoding_fix_jobs를 실제로 실행한다.
 
@@ -143,6 +145,9 @@ def run_conversions(
                     progress_cb(f"[smi 변환+검수 {k}/{n_convert}] {job.video.name}")
                 try:
                     parsed = parse_smi(job.smi_path)
+                    if not parsed:
+                        # 파서가 못 읽은 형식일 수 있다. 빈 자막을 만들고 원본까지 지우면 안 된다.
+                        raise ValueError("SMI에서 자막을 하나도 못 읽음 (원본은 그대로 둠)")
                     cue_objs = [
                         Cue(id=idx, start=c.start, end=c.end, text=c.text) for idx, c in enumerate(parsed)
                     ]
@@ -157,13 +162,29 @@ def run_conversions(
                         final_cues, job.smi_path.parent, formats, job.video.stem, lang, encodings
                     )
                     converted += 1
-                    if delete_old_smi:
+                    if worklog:
+                        worklog.event(
+                            "smi 변환", job.smi_path.name, "완료",
+                            f"{', '.join(w.name for w in job.written)} 생성, {len(final_cues)}줄, "
+                            f"AI 검수 후 원문 유지 {len(_vreport.failed_ids)}줄",
+                        )
+                    written_ok = bool(job.written) and all(w.exists() and w.stat().st_size > 0 for w in job.written)
+                    if delete_old_smi and not written_ok:
+                        if worklog:
+                            worklog.event("원본 smi 삭제", job.smi_path.name, "보존", "결과 파일을 확인하지 못해 원본을 지우지 않음")
+                    elif delete_old_smi:
                         job.smi_path.unlink(missing_ok=True)
                         deleted += 1
+                        if worklog:
+                            worklog.event("원본 smi 삭제", job.smi_path.name, "삭제함", "변환 성공 후 삭제 옵션에 따라")
+                    elif worklog:
+                        worklog.event("원본 smi 삭제", job.smi_path.name, "보존", "삭제 옵션을 켜지 않아 원본을 그대로 둠")
                 except PipelineCancelled:
                     raise
                 except Exception as e:  # noqa: BLE001
                     job.error = str(e)
+                    if worklog:
+                        worklog.event("smi 변환", job.smi_path.name, "실패", job.error.splitlines()[0][:200] if job.error else "")
         finally:
             server.stop()
 
@@ -177,7 +198,14 @@ def run_conversions(
             job.fixed = fix_encoding_file(job.path)
             if job.fixed:
                 fixed += 1
+            if worklog:
+                worklog.event(
+                    "인코딩 수정", job.path.name, "수정함" if job.fixed else "변경 없음",
+                    "BOM 있는 UTF-8로 다시 저장" if job.fixed else "이미 정상이거나 인코딩을 확신할 수 없어 그대로 둠",
+                )
         except Exception as e:  # noqa: BLE001
             job.error = str(e)
+            if worklog:
+                worklog.event("인코딩 수정", job.path.name, "실패", job.error.splitlines()[0][:200] if job.error else "")
 
     return converted, fixed, deleted

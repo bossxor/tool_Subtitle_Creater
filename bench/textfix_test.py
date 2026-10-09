@@ -50,3 +50,37 @@ check("leaked chars", r.leaked_chars, {1: "帰り"})  # 한자와 가나 둘 다
 check("leaked is retried", r.bad_ids, [1])
 
 print("모든 테스트 통과")
+
+# ---- 작업 로그 / 폴더 정리 안전성 ----
+import tempfile  # noqa: E402
+
+from core.worklog import LOG_FILENAME, WorkLog  # noqa: E402
+
+with tempfile.TemporaryDirectory() as tmp:
+    log = WorkLog(tmp)
+    log.begin("테스트 시작", ["상세 한 줄"])
+    log.event("번역", "a.mp4", "완료", "총 3줄")
+    log.end("테스트 끝")
+    log2 = WorkLog(tmp)  # 같은 파일에 이어 쓰기
+    log2.event("자막 저장", "b.mp4", "새로 만듦", "b.ko.srt (2줄)")
+    raw = (Path(tmp) / LOG_FILENAME).read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf"), "로그 맨 앞에 BOM이 없음"
+    assert raw.count(b"\xef\xbb\xbf") == 1, "이어 쓸 때 BOM이 중간에 또 들어감"
+    text = raw.decode("utf-8-sig")
+    assert "[번역] a.mp4 : 완료 - 총 3줄" in text and "[자막 저장] b.mp4 : 새로 만듦" in text
+
+    # 자막이 0줄인 smi는 실패로 처리하고 원본을 지우지 않는다
+    from core.config import Config, DEFAULT_CONFIG_PATH  # noqa: E402
+    from core.folder_scan import ConvertJob, FolderScanPlan, run_conversions  # noqa: E402
+
+    smi = Path(tmp) / "c.ko.smi"
+    smi.write_text("<SAMI><BODY></BODY></SAMI>", encoding="utf-8")
+    plan = FolderScanPlan(generate=[], convert_jobs=[ConvertJob(video=Path(tmp) / "c.mp4", smi_path=smi)], encoding_fix_jobs=[])
+    cfg = Config.load(DEFAULT_CONFIG_PATH)
+    cfg.set("paths.cache_dir", str(Path(tmp) / "cache"))
+    conv, _fixed, deleted = run_conversions(plan, ["srt"], cfg, delete_old_smi=True, worklog=WorkLog(tmp))
+    assert conv == 0 and deleted == 0, (conv, deleted)
+    assert smi.exists(), "빈 smi인데 원본이 지워짐"
+    assert plan.convert_jobs[0].error, "실패로 기록되지 않음"
+
+print("작업 로그/안전성 테스트 통과")

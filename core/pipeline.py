@@ -20,6 +20,7 @@ from core.llm import LlamaServer
 from core.segmenter import Cue, build_cues, cues_from_json, cues_to_json
 from core.stt import STTEngine, words_from_json, words_to_json
 from core.translate import translate_cues
+from core.worklog import WorkLog
 from core.writers import build_display_cues, write_ass, write_smi, write_srt
 
 __all__ = ["run_batch", "PipelineCancelled", "cache_dir_for", "predict_output_paths"]
@@ -122,6 +123,7 @@ def stage_stt(
     progress_cb: ProgressCB = None,
     cancel_check: CancelCheck = None,
     tracker: Optional[ProgressTracker] = None,
+    worklog: Optional[WorkLog] = None,
 ) -> dict[Path, "TranscriptionResult"]:
     precision = config.get("stt.precision", "turbo")
     model_dir = config.resolve_path(f"stt.models.{precision}")
@@ -139,6 +141,8 @@ def stage_stt(
         cache_file = cd / f"raw_words.{precision}.json"
         if cache_file.exists():
             results[v] = words_from_json(json.loads(cache_file.read_text(encoding="utf-8")))
+            if worklog:
+                worklog.event("음성 인식", v.name, "캐시 사용", f"단어 {len(results[v].words)}개 (이전 결과 재사용)")
             if tracker:
                 tracker.add(STAGE_WEIGHTS["stt"])
             continue
@@ -150,6 +154,11 @@ def stage_stt(
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         cache_file.write_text(json.dumps(words_to_json(res), ensure_ascii=False), encoding="utf-8")
         results[v] = res
+        if worklog:
+            worklog.event(
+                "음성 인식", v.name, "완료",
+                f"모델 {precision}, 감지 언어 {res.language}, 단어 {len(res.words)}개, 길이 {res.duration / 60:.1f}분",
+            )
         if tracker:
             tracker.add(STAGE_WEIGHTS["stt"])
     return results
@@ -162,6 +171,7 @@ def stage_segment(
     progress_cb: ProgressCB = None,
     cancel_check: CancelCheck = None,
     tracker: Optional[ProgressTracker] = None,
+    worklog: Optional[WorkLog] = None,
 ) -> dict[Path, list[Cue]]:
     precision = config.get("stt.precision", "turbo")
     results = {}
@@ -172,6 +182,8 @@ def stage_segment(
         cache_file = cd / f"cues_source.{precision}.json"
         if cache_file.exists():
             results[v] = cues_from_json(json.loads(cache_file.read_text(encoding="utf-8")))
+            if worklog:
+                worklog.event("자막 구간 나누기", v.name, "캐시 사용", f"{len(results[v])}줄")
             if tracker:
                 tracker.add(STAGE_WEIGHTS["segment"])
             continue
@@ -180,6 +192,8 @@ def stage_segment(
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         cache_file.write_text(json.dumps(cues_to_json(cues), ensure_ascii=False, indent=1), encoding="utf-8")
         results[v] = cues
+        if worklog:
+            worklog.event("자막 구간 나누기", v.name, "완료", f"{len(cues)}줄")
         if tracker:
             tracker.add(STAGE_WEIGHTS["segment"])
     return results
@@ -193,6 +207,7 @@ def stage_translate(
     progress_cb: ProgressCB = None,
     cancel_check: CancelCheck = None,
     tracker: Optional[ProgressTracker] = None,
+    worklog: Optional[WorkLog] = None,
 ) -> dict[Path, dict[int, str]]:
     source_lang = config.get("source_language")
     target_lang = config.get("target_language")
@@ -202,6 +217,8 @@ def stage_translate(
     if source_lang == target_lang:
         for v in videos:
             results[v] = {c.id: c.text for c in cues_map[v]}
+            if worklog:
+                worklog.event("번역", v.name, "건너뜀", "원어와 번역 대상 언어가 같아 번역하지 않음")
             if tracker:
                 tracker.add(translate_weight)
         return results
@@ -212,6 +229,8 @@ def stage_translate(
         if cache_file.exists():
             raw = json.loads(cache_file.read_text(encoding="utf-8"))
             results[v] = {int(k): val for k, val in raw.items()}
+            if worklog:
+                worklog.event("번역", v.name, "캐시 사용", f"{len(results[v])}줄 (이전 번역 결과 재사용)")
             if tracker:
                 tracker.add(translate_weight)
         else:
@@ -256,6 +275,13 @@ def stage_translate(
                 logger.warning(
                     "%s: 번역 실패로 원문이 유지된 항목 %d개: %s", v, len(report.failed_ids), report.failed_ids
                 )
+            if worklog:
+                detail = f"총 {len(ko_map)}줄"
+                if report.transliterated_ids:
+                    detail += f", 소리 나는 대로 한글로 옮긴 줄 {len(report.transliterated_ids)}개"
+                if report.failed_ids:
+                    detail += f", 일본어 원문이 남은 줄 {len(report.failed_ids)}개(줄 번호 {report.failed_ids[:30]})"
+                worklog.event("번역", v.name, "완료" if not report.failed_ids else "일부 미번역", detail)
             if tracker and n_cues == 0:
                 # translate_cues가 빈 목록은 배치를 만들지 않고 바로 반환해 on_batch_done이
                 # 한 번도 안 불리므로, 이 영상 몫은 여기서 대신 채워준다.
@@ -280,6 +306,7 @@ def stage_write(
     config,
     progress_cb: ProgressCB = None,
     tracker: Optional[ProgressTracker] = None,
+    worklog: Optional[WorkLog] = None,
 ) -> dict[Path, list[Path]]:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -295,17 +322,23 @@ def stage_write(
         "smi": (write_smi, config.get("subtitle.smi_encoding", "utf-8-sig")),
     }
 
+    current_video = {"name": ""}  # 로그에 영상 전체 이름을 쓰려고 _write_all이 읽는다
+
     def _write_all(display, stem: str, lang: str, paths: list[Path]) -> None:
         for fmt in formats:
             writer, encoding = writer_for[fmt]
             p = out_dir / f"{stem}.{lang}.{fmt}"
+            existed = p.exists()
             writer(display, p, encoding=encoding)
             paths.append(p)
+            if worklog:
+                worklog.event("자막 저장", current_video["name"], "덮어씀" if existed else "새로 만듦", f"{p.name} ({len(display)}줄)")
 
     outputs: dict[Path, list[Path]] = {}
     for i, v in enumerate(videos, 1):
         _report(progress_cb, f"[자막 저장 {i}/{len(videos)}] {v.name}")
         stem = Path(v).stem
+        current_video["name"] = Path(v).name
         cues = cues_map[v]
         src_map = {c.id: c.text for c in cues}
         bilingual_src = src_map if (bilingual and source_lang != target_lang) else None
@@ -340,8 +373,36 @@ def run_batch(
     videos = [Path(v) for v in videos]
     tracker = ProgressTracker(total_videos=len(videos), on_fraction=progress_fraction_cb)
 
-    wav_paths = stage_audio(videos, config, progress_cb, cancel_check, tracker)
-    stt_results = stage_stt(videos, wav_paths, config, progress_cb, cancel_check, tracker)
-    cues_map = stage_segment(videos, stt_results, config, progress_cb, cancel_check, tracker)
-    translations = stage_translate(videos, cues_map, config, glossary, progress_cb, cancel_check, tracker)
-    return stage_write(videos, cues_map, translations, out_dir, config, progress_cb, tracker)
+    worklog = WorkLog(out_dir) if config.get("subtitle.worklog", True) else None
+    if worklog:
+        fmts = "/".join(config.get("subtitle.formats", ["srt"]))
+        worklog.begin(
+            f"자막 생성 시작 - 영상 {len(videos)}개",
+            [
+                f"언어: {config.get('source_language')} -> {config.get('target_language')}",
+                f"음성 인식 정밀도: {config.get('stt.precision')}, 자막 형식: {fmts}",
+                "대상 파일:",
+                *[f"  {i}. {v}" for i, v in enumerate(videos, 1)],
+            ],
+        )
+    try:
+        wav_paths = stage_audio(videos, config, progress_cb, cancel_check, tracker)
+        stt_results = stage_stt(videos, wav_paths, config, progress_cb, cancel_check, tracker, worklog)
+        cues_map = stage_segment(videos, stt_results, config, progress_cb, cancel_check, tracker, worklog)
+        translations = stage_translate(
+            videos, cues_map, config, glossary, progress_cb, cancel_check, tracker, worklog
+        )
+        outputs = stage_write(videos, cues_map, translations, out_dir, config, progress_cb, tracker, worklog)
+    except PipelineCancelled:
+        if worklog:
+            worklog.note("사용자가 취소함. 이미 끝난 단계는 캐시에 남아 있어 이어서 할 수 있음")
+            worklog.end("취소로 끝남")
+        raise
+    except Exception as e:
+        if worklog:
+            worklog.note(f"오류로 중단됨: {type(e).__name__}: {str(e).splitlines()[0][:200] if str(e) else ''}")
+            worklog.end("오류로 끝남")
+        raise
+    if worklog:
+        worklog.end(f"자막 생성 끝 - 영상 {len(outputs)}개")
+    return outputs

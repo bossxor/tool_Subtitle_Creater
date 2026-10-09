@@ -38,6 +38,7 @@ from core.config import Config, DEFAULT_CONFIG_PATH
 from core.folder_scan import plan_folder
 from core.pipeline import predict_output_paths
 from core.setup_assets import list_missing
+from core.worklog import LOG_FILENAME
 from gui.asset_worker import AssetDownloadWorker
 from gui.folder_worker import FolderCleanupWorker
 from gui.progress_model import StageTracker
@@ -549,7 +550,7 @@ class MainWindow(QMainWindow):
         dlg.setAutoReset(False)
         dlg.setMinimumWidth(420)
 
-        worker = FolderCleanupWorker(plan, formats, config, delete_old_smi)
+        worker = FolderCleanupWorker(plan, formats, config, delete_old_smi, self.out_dir_edit.text().strip())
         loop = QEventLoop()
         result = {"ok": None}
 
@@ -779,6 +780,7 @@ class MainWindow(QMainWindow):
 
     def _on_finished_ok(self, outputs: dict) -> None:
         self.status_label.setText("완료")
+        self.log_view.appendPlainText(f"작업 로그: {Path(self.out_dir_edit.text().strip()) / LOG_FILENAME}")
         self.tracker.finish_all()
         self._refresh_counts()
         self.count_label.setText(self.count_label.text() + f"\n소요 시간 {self._elapsed_text()}")

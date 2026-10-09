@@ -36,6 +36,7 @@ class LlamaServer:
         self.ctx_size = ctx_size
         self.log_path = Path(log_path) if log_path else None
         self.proc: Optional[subprocess.Popen] = None
+        self._log_file = None  # 서버 로그를 받는 파일 핸들. stop()에서 닫지 않으면 파일이 계속 잠긴다
 
     @property
     def base_url(self) -> str:
@@ -68,32 +69,46 @@ class LlamaServer:
             "--port",
             str(self.port),
         ]
-        log_file = open(self.log_path, "w", encoding="utf-8") if self.log_path else subprocess.DEVNULL
+        self._log_file = open(self.log_path, "w", encoding="utf-8") if self.log_path else None
         self.proc = subprocess.Popen(
-            cmd, stdout=log_file, stderr=subprocess.STDOUT, creationflags=NO_WINDOW_FLAGS
+            cmd,
+            stdout=self._log_file or subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            creationflags=NO_WINDOW_FLAGS,
         )
 
         deadline = time.time() + timeout
         while time.time() < deadline:
             if self.proc.poll() is not None:
-                raise LlamaServerError(
-                    f"llama-server가 시작 중 종료됨 (exit={self.proc.returncode}). 로그: {self.log_path}"
-                )
+                code = self.proc.returncode
+                self.proc = None
+                self._close_log()
+                raise LlamaServerError(f"llama-server가 시작 중 종료됨 (exit={code}). 로그: {self.log_path}")
             if self.is_alive():
                 return
             time.sleep(0.5)
+        self.stop()
         raise LlamaServerError(f"llama-server가 {timeout}초 안에 준비되지 않음. 로그: {self.log_path}")
 
     def stop(self) -> None:
-        if self.proc is None:
-            return
-        if self.proc.poll() is None:
-            self.proc.terminate()
+        if self.proc is not None:
+            if self.proc.poll() is None:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait()
+            self.proc = None
+        self._close_log()
+
+    def _close_log(self) -> None:
+        if self._log_file is not None:
             try:
-                self.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-        self.proc = None
+                self._log_file.close()
+            except OSError:
+                pass
+            self._log_file = None
 
     def chat(
         self,

@@ -50,6 +50,7 @@ subtitle:
   # 만들 출력 형식: srt / ass / smi 중 고르면 된다. 기본은 srt 하나만(영상 1개당 자막 파일 1개).
   # srt는 꾸밈 없는 가장 호환성 좋은 표준 포맷이라 기본값으로 선택함. 스타일링이 필요하면 ass로 바꾸면 됨.
   formats: [srt]
+  worklog: true            # 자막 저장 폴더에 작업 로그(Subtitle_Tool_작업로그.txt)를 남길지
   emit_source: false       # 원문(일본어) 자막도 만들지
   bilingual: false         # 이중 자막(원문+번역 한 줄에)
   # 기본은 BOM 있는 UTF-8(utf-8-sig). BOM이 없으면 곰플레이어 등 일부 플레이어가 한글을
