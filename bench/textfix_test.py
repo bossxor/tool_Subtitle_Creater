@@ -104,8 +104,16 @@ assert "Japanese (ja) to Korean (ko) translator" in pr and pr.rstrip().endswith(
 class FakeLLM:
     """complete()가 프롬프트에 따라 정해진 답을 돌려주는 가짜 서버. 호출 기록도 남긴다."""
 
+    generation = 0
+    restart_count = 0
+
     def __init__(self, answers):
         self.answers, self.calls = answers, []
+
+    def restart_if_generation(self, seen):
+        self.restart_count += 1
+        self.generation += 1
+        return True
 
     def complete(self, prompt, temperature=0.1, n_predict=300, stop=None, timeout=300):
         self.calls.append((prompt, temperature))
@@ -141,7 +149,62 @@ temps = [t for p, t in fake.calls if p.endswith("行こう<end_of_turn>\n<start_
 assert len(temps) == 2 and temps[1] > temps[0], f"재시도에서 온도가 안 올라감: {temps}"
 assert any("Do not use these characters" in p for p, _ in fake.calls), "재시도에 avoid 힌트가 없음"
 
+# 응답 없음(시간 초과): 서버를 다시 띄우고 같은 줄을 재시도해야 한다
+import requests  # noqa: E402
+
+
+class TimeoutOnceLLM(FakeLLM):
+    def complete(self, prompt, temperature=0.1, n_predict=300, stop=None, timeout=300):
+        if not self.calls:
+            self.calls.append((prompt, temperature))
+            raise requests.ReadTimeout("timed out")
+        return super().complete(prompt, temperature, n_predict, stop, timeout)
+
+
+slow = TimeoutOnceLLM({"おはよう": "안녕"})
+out, rep = translate_cues_gemma([Cue(id=0, start=0, end=1, text="おはよう")], slow, cfg)
+check("timeout then retry", out[0], "안녕")
+check("server restarted once", slow.restart_count, 1)
+
+# LlamaServer.restart_if_generation: 여러 스레드가 동시에 불러도 실제 재시작은 한 번
+import threading  # noqa: E402
+from core.llm import LlamaServer  # noqa: E402
+
+srv = LlamaServer(Path("x.exe"), Path("m.gguf"), n_gpu_layers=None)
+starts = []
+srv.proc = object()
+srv.stop = lambda: None
+srv.start = lambda: starts.append(1)
+gen0 = srv.generation
+ts = [threading.Thread(target=srv.restart_if_generation, args=(gen0,)) for _ in range(4)]
+[t.start() for t in ts]
+[t.join() for t in ts]
+check("restart only once for 4 threads", (len(starts), srv.restart_count, srv.generation), (1, 1, gen0 + 1))
+srv.proc = None
+check("no restart of server we did not start", srv.restart_if_generation(srv.generation), False)
+
 print("말투/TranslateGemma 백엔드 테스트 통과")
+
+# ---- 남은 시간 추정 ----
+from gui.progress_model import EtaEstimator, format_duration, format_remaining  # noqa: E402
+
+check("duration short", format_duration(125), "02:05")
+check("duration long", format_duration(3725), "1:02:05")
+check("remaining hours", format_remaining(3900), "약 1시간 5분")
+check("remaining minutes", format_remaining(600), "약 10분")
+check("remaining tiny", format_remaining(20), "1분 미만")
+
+eta = EtaEstimator()
+eta.reset(0.0)
+eta.update(0.1, 0.5)  # 캐시 재사용: 시작하자마자 50%로 뜀. 속도 계산에서 빠져야 한다
+check("too early", eta.remaining(10.0), None)
+for t in range(60, 601, 60):  # 그 뒤로 1분에 1%씩
+    eta.update(float(t), 0.5 + 0.01 * t / 60)
+r = eta.remaining(600.0)  # 남은 40% / (10% per 600s) = 2400s
+assert r is not None and abs(r - 2400) < 1, r
+r_later = eta.remaining(900.0)  # 5분 동안 진행이 없으면 남은 시간이 늘어난다
+assert r_later > r, (r, r_later)
+print("남은 시간 추정 테스트 통과")
 
 # ---- 음성 인식 확신도 요약 / 예전 캐시 호환 ----
 from core.stt import TranscriptionResult, Word, confidence_summary, words_from_json, words_to_json  # noqa: E402

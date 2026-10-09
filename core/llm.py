@@ -6,6 +6,7 @@ Qwen3 계열은 기본적으로 내부 사고(thinking) 토큰을 생성해 느�
 from __future__ import annotations
 
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -25,7 +26,7 @@ class LlamaServer:
         server_exe: Path,
         model_path: Path,
         port: int = 8090,
-        n_gpu_layers: int = 999,
+        n_gpu_layers: Optional[int] = 999,
         ctx_size: int = 8192,
         log_path: Optional[Path] = None,
         extra_args: Optional[list[str]] = None,
@@ -38,6 +39,10 @@ class LlamaServer:
         self.log_path = Path(log_path) if log_path else None
         self.extra_args = list(extra_args or [])  # 예: ["--no-jinja"]
         self.proc: Optional[subprocess.Popen] = None
+        self.restart_count = 0  # 응답이 없어 다시 띄운 횟수
+        self._generation = 0  # 다시 띄울 때마다 1씩 늘어난다 (여러 스레드가 한 번만 재시작하게 하는 용도)
+        self._restart_lock = threading.Lock()
+        self._append_log = False  # 재시작할 때는 이전 로그를 지우지 않고 이어 쓴다
         self._log_file = None  # 서버 로그를 받는 파일 핸들. stop()에서 닫지 않으면 파일이 계속 잠긴다
 
     @property
@@ -64,15 +69,15 @@ class LlamaServer:
             str(self.server_exe),
             "-m",
             str(self.model_path),
-            "-ngl",
-            str(self.n_gpu_layers),
+            *(["-ngl", str(self.n_gpu_layers)] if self.n_gpu_layers is not None else []),
             "-c",
             str(self.ctx_size),
             "--port",
             str(self.port),
             *self.extra_args,
         ]
-        self._log_file = open(self.log_path, "w", encoding="utf-8") if self.log_path else None
+        mode = "a" if self._append_log else "w"
+        self._log_file = open(self.log_path, mode, encoding="utf-8") if self.log_path else None
         self.proc = subprocess.Popen(
             cmd,
             stdout=self._log_file or subprocess.DEVNULL,
@@ -105,6 +110,29 @@ class LlamaServer:
             self.proc = None
         self._close_log()
 
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    def restart_if_generation(self, seen_generation: int) -> bool:
+        """요청이 시간 초과됐을 때 서버를 다시 띄운다. 여러 스레드가 동시에 불러도 한 번만 재시작한다.
+
+        seen_generation: 요청을 보내기 전에 읽어 둔 generation. 그사이 다른 스레드가 이미 재시작했으면
+        아무것도 하지 않는다. 다시 띄우면 GPU 메모리를 새로 잡으므로, 다른 프로그램이 GPU 메모리를 차지해
+        서버가 극단적으로 느려진 상황에서 빠져나올 수 있다. 실제로 재시작했으면 True.
+        """
+        with self._restart_lock:
+            if self._generation != seen_generation:
+                return False
+            if self.proc is None:
+                return False  # 이 객체가 띄운 서버가 아니면(재사용 중) 건드리지 않는다
+            self.stop()
+            self._append_log = True
+            self.start()
+            self._generation += 1
+            self.restart_count += 1
+            return True
+
     def _close_log(self) -> None:
         if self._log_file is not None:
             try:
@@ -119,7 +147,7 @@ class LlamaServer:
         temperature: float = 0.1,
         n_predict: int = 300,
         stop: Optional[list[str]] = None,
-        timeout: float = 300.0,
+        timeout: float = 120.0,
     ) -> str:
         """채팅 템플릿 없이 완성된 프롬프트 문자열을 그대로 보내 이어 쓰게 한다 (TranslateGemma용)."""
         r = requests.post(

@@ -8,7 +8,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QEventLoop, Qt
+from PySide6.QtCore import QEventLoop, Qt, QTimer
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -41,7 +41,7 @@ from core.setup_assets import list_missing
 from core.worklog import LOG_FILENAME
 from gui.asset_worker import AssetDownloadWorker
 from gui.folder_worker import FolderCleanupWorker
-from gui.progress_model import StageTracker
+from gui.progress_model import EtaEstimator, StageTracker, format_duration, format_remaining
 from gui.worker import PipelineWorker
 
 STYLE_SHEET = """
@@ -190,6 +190,7 @@ class MainWindow(QMainWindow):
         self.worker: PipelineWorker | None = None
         self.tracker = StageTracker()
         self._t0 = 0.0
+        self._clock_dialog = None  # 폴더 정리 중에는 진행 다이얼로그에도 시간을 보여준다
         self._current_videos: list[str] = []
 
         root = QWidget()
@@ -363,6 +364,14 @@ class MainWindow(QMainWindow):
         self.progress_bar.setTextVisible(True)
         self.progress_bar.setFormat("%p%")
         self.progress_bar.setVisible(False)
+        self.time_label = QLabel("")
+        self.time_label.setStyleSheet("color: #555;")
+        self.time_label.setVisible(False)
+        self.eta = EtaEstimator()
+        self._last_fraction = 0.0
+        self.clock = QTimer(self)
+        self.clock.setInterval(1000)
+        self.clock.timeout.connect(self._refresh_time)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(5000)
@@ -376,6 +385,7 @@ class MainWindow(QMainWindow):
         v.addWidget(self.count_label)
         v.addWidget(self.status_label)
         v.addWidget(self.progress_bar)
+        v.addWidget(self.time_label)
         v.addWidget(self.log_view)
         v.addWidget(self.result_title)
         v.addWidget(self.result_table)
@@ -419,8 +429,34 @@ class MainWindow(QMainWindow):
         self.result_title.setVisible(bool(rows))
 
     def _elapsed_text(self) -> str:
-        sec = int(time.monotonic() - self._t0) if self._t0 else 0
-        return f"{sec // 60:02d}:{sec % 60:02d}"
+        return format_duration(time.monotonic() - self._t0 if self._t0 else 0)
+
+    def _refresh_time(self) -> None:
+        """1초마다 가동 시간과 남은 시간(추정)을 갱신한다."""
+        now = time.monotonic()
+        text = f"가동 시간 {self._elapsed_text()}"
+        if self._last_fraction > 0:
+            remaining = self.eta.remaining(now)
+            if remaining is None:
+                text += "   ·   남은 시간 계산 중..."
+            else:
+                finish = time.strftime("%H:%M", time.localtime(time.time() + remaining))
+                text += f"   ·   남은 시간 {format_remaining(remaining)} (예상 종료 {finish})"
+        self.time_label.setText(text)
+        if self._clock_dialog is not None:
+            self._clock_dialog.setLabelText("\n".join([*self.tracker.lines(), "", text]))
+
+    def _start_clock(self) -> None:
+        self._t0 = time.monotonic()
+        self.eta.reset(self._t0)
+        self._last_fraction = 0.0
+        self.time_label.setVisible(True)
+        self._refresh_time()
+        self.clock.start()
+
+    def _stop_clock(self) -> None:
+        self.clock.stop()
+        self.time_label.setText(f"가동 시간 {self._elapsed_text()}")
 
     # ---------- 이벤트 핸들러 ----------
 
@@ -554,7 +590,6 @@ class MainWindow(QMainWindow):
         self.tracker.reset()
         self.tracker.set_expected("smi 변환+검수", len(plan.convert_jobs))
         self.tracker.set_expected("인코딩 수정", len(plan.encoding_fix_jobs))
-        self._t0 = time.monotonic()
         dlg = QProgressDialog("폴더를 정리하는 중...", "취소", 0, max(total, 1), self)
         dlg.setWindowTitle("폴더 정리")
         dlg.setWindowModality(Qt.WindowModal)
@@ -573,7 +608,8 @@ class MainWindow(QMainWindow):
             self.tracker.update(message)
             done, _all = self.tracker.overall_done(stages)
             dlg.setValue(done)
-            dlg.setLabelText("\n".join(self.tracker.lines()))
+            self._on_progress_fraction(done / max(total, 1))
+            self._refresh_time()
             self.status_label.setText(message)
             self.log_view.appendPlainText(message)
             self._refresh_counts()
@@ -597,9 +633,15 @@ class MainWindow(QMainWindow):
         worker.failed.connect(on_failed)
         dlg.canceled.connect(worker.request_cancel)
 
+        self._clock_dialog = dlg
+        self._start_clock()
         worker.start()
         dlg.show()
-        loop.exec()
+        try:
+            loop.exec()
+        finally:
+            self._clock_dialog = None
+            self._stop_clock()
         dlg.close()
         worker.wait(5000)
         return result["ok"] if result["ok"] is not None else (None, None, None)
@@ -705,7 +747,7 @@ class MainWindow(QMainWindow):
         self.tracker.reset()
         self.tracker.set_expected("오디오 추출", len(videos))
         self._current_videos = videos
-        self._t0 = time.monotonic()
+        self._start_clock()
         self._show_results([])
         self._refresh_counts()
         self.status_label.setText("시작하는 중...")
@@ -784,8 +826,11 @@ class MainWindow(QMainWindow):
 
     def _on_progress_fraction(self, fraction: float) -> None:
         self.progress_bar.setValue(round(fraction * 100))
+        self._last_fraction = fraction
+        self.eta.update(time.monotonic(), fraction)
 
     def _reset_run_state(self) -> None:
+        self._stop_clock()
         self.progress_bar.setVisible(False)
         self.start_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)

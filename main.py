@@ -42,6 +42,9 @@ def _selftest() -> int:
 
     if "--full-pipeline" in sys.argv:
         idx = sys.argv.index("--full-pipeline")
+        if len(sys.argv) < idx + 3:
+            print("[selftest] 사용법: Subtitle_Tool.exe --selftest --full-pipeline <영상 경로> <출력 폴더>")
+            return 2
         video, out_dir = sys.argv[idx + 1], sys.argv[idx + 2]
         from core.pipeline import run_batch
 

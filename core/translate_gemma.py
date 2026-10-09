@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import re
+import requests
 from concurrent.futures import ThreadPoolExecutor
 
 from core.errors import PipelineCancelled
@@ -74,6 +75,7 @@ def translate_cues_gemma(
     max_retries = config.get("llm.max_retries", 3)
     temperature = config.get("llm.translate_temperature", 0.1)
     workers = max(1, int(config.get("llm.translate_parallel", 4)))
+    request_timeout = float(config.get("llm.translate_timeout", 120))
 
     glossary_hint = ""
     if glossary:
@@ -99,14 +101,28 @@ def translate_cues_gemma(
             hint = base_hint
             if bad:
                 hint = (hint + f" Do not use these characters: {bad}. Write everything in Hangul.").strip()
+            generation = llm.generation
             try:
                 raw = llm.complete(
                     build_prompt(c.text, source_lang, target_lang, hint),
                     temperature=temperature + 0.3 * attempt,
                     n_predict=n_predict,
+                    timeout=request_timeout,
                 )
-            except Exception:  # noqa: BLE001
-                logger.exception("TranslateGemma 요청 실패 (cue %s, attempt %s)", c.id, attempt)
+            except (requests.Timeout, requests.ConnectionError) as e:
+                # 평소 한 줄은 몇 초면 끝난다. 응답이 없으면 서버가 GPU 메모리 부족 등으로 극단적으로 느려진
+                # 것이므로 같은 서버에 계속 기다리지 않고 다시 띄운 뒤 재시도한다.
+                logger.warning("번역 서버 응답 없음 (cue %s, %s초 초과): %s", c.id, request_timeout, type(e).__name__)
+                if cancel_check is not None and cancel_check():
+                    raise PipelineCancelled() from e
+                try:
+                    if llm.restart_if_generation(generation):
+                        logger.warning("번역 서버를 다시 시작함 (%s번째)", llm.restart_count)
+                except Exception:  # noqa: BLE001
+                    logger.exception("번역 서버 재시작 실패")
+                continue
+            except Exception as e:  # noqa: BLE001
+                logger.warning("TranslateGemma 요청 실패 (cue %s, attempt %s): %s", c.id, attempt, e)
                 continue
             out = _clean_output(raw, c.text)
             if not out:

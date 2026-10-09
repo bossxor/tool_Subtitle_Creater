@@ -86,3 +86,66 @@ class StageTracker:
             stage, k, n, name = self.current
             out.append(f"현재: {stage} {k}/{n} · {name}")
         return out
+
+
+def format_duration(sec: float) -> str:
+    """경과 시간 표시용: 1:02:03 / 02:03."""
+    sec = max(0, int(sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def format_remaining(sec: float) -> str:
+    """남은 시간 표시용: 약 1시간 5분 / 약 12분 / 1분 미만."""
+    minutes = int(round(sec / 60))
+    if minutes < 1:
+        return "1분 미만"
+    h, m = divmod(minutes, 60)
+    return f"약 {h}시간 {m}분" if h else f"약 {m}분"
+
+
+class EtaEstimator:
+    """진행률(0~1) 변화로 남은 시간을 추정한다.
+
+    - 캐시를 재사용한 부분은 순식간에 진행률이 뛰므로, 직전 갱신에서 BURST_GAP초 안에 들어온 증가분은
+      속도 계산에서 뺀다 (안 빼면 처음에 속도를 크게 잡아 남은 시간이 너무 짧게 나온다).
+    - 단계마다 실제 속도가 진행률 가중치와 다르므로 최근 WINDOW초 동안의 속도로 계산한다.
+    - 갱신이 없는 동안에도 시간은 흐르므로, 오래 진행이 없으면 속도가 줄어 남은 시간이 늘어난다.
+    """
+
+    BURST_GAP = 1.0
+    WINDOW = 20 * 60
+    MIN_ELAPSED = 30.0
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self, now: float | None = None) -> None:
+        self.t_start = now
+        self.last_t: float | None = None
+        self.last_f = 0.0
+        self.steps: list[tuple[float, float]] = []  # (시각, 실제 처리로 늘어난 진행률)
+
+    def update(self, now: float, fraction: float) -> None:
+        if self.t_start is None:
+            self.t_start = now
+        prev_t = self.last_t if self.last_t is not None else self.t_start
+        delta = fraction - self.last_f
+        if delta > 0 and now - prev_t >= self.BURST_GAP:
+            self.steps.append((now, delta))
+        self.last_t, self.last_f = now, max(self.last_f, fraction)
+        cutoff = now - self.WINDOW
+        while self.steps and self.steps[0][0] < cutoff:
+            self.steps.pop(0)
+
+    def remaining(self, now: float) -> float | None:
+        """남은 초. 아직 추정할 자료가 부족하면 None."""
+        if self.t_start is None or now - self.t_start < self.MIN_ELAPSED or self.last_f >= 1.0:
+            return None
+        window_start = max(self.t_start, now - self.WINDOW)
+        progressed = sum(d for t, d in self.steps if t >= window_start)
+        span = now - window_start
+        if progressed <= 0 or span <= 0:
+            return None
+        return (1.0 - self.last_f) / (progressed / span)

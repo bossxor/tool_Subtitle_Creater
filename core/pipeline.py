@@ -216,11 +216,18 @@ def stage_segment(
     return results
 
 
-def _start_server_with_fallback(config, model_path: Path, port: int, ctx: int, extra_args, log_path: Path) -> LlamaServer:
-    """GPU 메모리가 모자라 서버가 못 뜨면 GPU에 올리는 층 수를 줄여서 다시 시도한다 (느려지지만 동작)."""
-    first = config.get("llm.n_gpu_layers", 999)
+def _start_server_with_fallback(
+    config, model_path: Path, port: int, ctx: int, extra_args, log_path: Path, ngl_key: str = "llm.n_gpu_layers"
+) -> LlamaServer:
+    """GPU 메모리가 모자라 서버가 못 뜨면 GPU에 올리는 층 수를 줄여서 다시 시도한다 (느려지지만 동작).
+
+    설정값이 "auto"면 -ngl을 넘기지 않아 llama.cpp가 남은 GPU 메모리에 맞춰 층 수를 정한다.
+    """
+    first = config.get(ngl_key, 999)
+    if first == "auto":
+        first = None
     last_error: Exception | None = None
-    for ngl in dict.fromkeys([first, 36, 24, 0]):
+    for ngl in dict.fromkeys([first, 24, 0] if first is None else [first, 36, 24, 0]):
         server = LlamaServer(
             server_exe=config.resolve_path("llm.server_exe"),
             model_path=model_path,
@@ -292,14 +299,16 @@ def stage_translate(
         ctx = config.get("llm.translate_ctx_size", 4096)
         extra_args = config.get("llm.translate_extra_args", ["--no-jinja"])
         translate_fn = translate_cues_gemma
+        ngl_key = "llm.translate_n_gpu_layers"
     else:
         model_path = config.resolve_path("llm.model")
         port = config.get("llm.port", 8090)
         ctx = config.get("llm.ctx_size", 8192)
         extra_args = []
         translate_fn = translate_cues
+        ngl_key = "llm.n_gpu_layers"
     _report(progress_cb, f"번역 모델 시작 중 ({model_path.name})")
-    server = _start_server_with_fallback(config, model_path, port, ctx, extra_args, log_dir / "llama-server.log")
+    server = _start_server_with_fallback(config, model_path, port, ctx, extra_args, log_dir / "llama-server.log", ngl_key)
     try:
         batch_size = config.get("llm.batch_sentences", 25)
         for i, v in enumerate(pending, 1):
@@ -310,6 +319,7 @@ def stage_translate(
             n_batches = max(1, math.ceil(n_cues / batch_size)) if n_cues else 1
             per_batch_weight = translate_weight / n_batches
             on_batch_done = (lambda w=per_batch_weight: tracker.add(w)) if tracker else None
+            restarts_before = server.restart_count
 
             ko_map, report = translate_fn(
                 cues_map[v],
@@ -329,6 +339,9 @@ def stage_translate(
                     detail += f", 소리 나는 대로 한글로 옮긴 줄 {len(report.transliterated_ids)}개"
                 if report.failed_ids:
                     detail += f", 일본어 원문이 남은 줄 {len(report.failed_ids)}개(줄 번호 {report.failed_ids[:30]})"
+                restarts = server.restart_count - restarts_before
+                if restarts:
+                    detail += f", 번역 서버가 응답하지 않아 {restarts}번 다시 시작함(GPU 메모리 부족 의심)"
                 worklog.event("번역", v.name, "완료" if not report.failed_ids else "일부 미번역", detail)
             if tracker and n_cues == 0:
                 # translate_cues가 빈 목록은 배치를 만들지 않고 바로 반환해 on_batch_done이

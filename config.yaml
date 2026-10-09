@@ -23,8 +23,15 @@ llm:
   translate_backend: translategemma
   translate_model: models/llm/translategemma-12b-it.IQ4_XS.gguf
   translate_port: 8092
-  translate_ctx_size: 4096
-  translate_extra_args: ["--no-jinja"]   # 이 모델의 특수 채팅 템플릿을 서버가 못 읽어서 끈다(직접 프롬프트를 만들어 보냄)
+  # GPU 8GB에서 바탕화면/브라우저 등이 이미 1~2GB를 쓰면 모델(6.6GB)이 다 안 들어가 공유 메모리로 넘치고,
+  # 다른 프로그램이 GPU를 더 쓰는 순간 번역이 100배 넘게 느려져 멈춘 것처럼 됐다. 그래서
+  # - GPU 층 수를 직접 정하지 않고(auto) llama.cpp가 남은 GPU 메모리에 맞춰 정하게 하고
+  # - 문맥 길이를 줄이고 KV 캐시를 8비트로 저장해 메모리를 아낀다 (한 줄 번역은 수백 토큰이면 충분)
+  translate_n_gpu_layers: auto
+  translate_ctx_size: 3072
+  # --no-jinja: 이 모델의 특수 채팅 템플릿을 서버가 못 읽어서 끈다(직접 프롬프트를 만들어 보냄)
+  translate_extra_args: ["--no-jinja", "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0"]
+  translate_timeout: 120                 # 한 줄 요청이 이 시간(초)을 넘기면 서버를 다시 띄우고 재시도
   translate_parallel: 4                  # 줄 단위 번역을 동시에 보내는 개수
   translate_temperature: 0.1
   # 아래는 Qwen3(범용 모델): json 백엔드와, smi 변환 때 AI가 깨진 글자를 검수할 때 쓴다
