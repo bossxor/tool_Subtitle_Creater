@@ -293,8 +293,8 @@ class MainWindow(QMainWindow):
         )
 
         self.precision_combo = QComboBox()
-        self.precision_combo.addItem("빠름 (large-v3-turbo, 권장)", "turbo")
-        self.precision_combo.addItem("고정밀 (large-v3, 느림)", "large")
+        self.precision_combo.addItem("정확 (large-v3, 권장)", "large")
+        self.precision_combo.addItem("빠름 (large-v3-turbo, 약 3배 빠름)", "turbo")
         form.addWidget(_row(QLabel("음성 인식 속도/정확도:"), self.precision_combo))
 
         fmt_label = QLabel("자막 형식:")

@@ -5,8 +5,8 @@ source_language: ja
 target_language: ko
 
 stt:
-  # "turbo" (기본, 빠름) 또는 "large" (고정밀)
-  precision: turbo
+  # "large"(기본, large-v3: 정확) 또는 "turbo"(약 3배 빠름). 10분 음성에서 large 17초 vs turbo 6초라 시간 차이는 작다
+  precision: large
   models:
     turbo: models/whisper/large-v3-turbo
     large: models/whisper/large-v3

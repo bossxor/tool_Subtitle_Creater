@@ -67,6 +67,7 @@ class Word:
     start: float
     end: float
     text: str
+    prob: float | None = None  # 단어 인식 확신도(0~1). 예전 캐시에는 없다
 
 
 @dataclass
@@ -106,7 +107,7 @@ class STTEngine:
         for seg in segments:
             if seg.words:
                 for w in seg.words:
-                    words.append(Word(start=w.start, end=w.end, text=w.word))
+                    words.append(Word(start=w.start, end=w.end, text=w.word, prob=getattr(w, "probability", None)))
             elif seg.text.strip():
                 # word_timestamps가 비어 있는 드문 경우를 대비한 폴백
                 words.append(Word(start=seg.start, end=seg.end, text=seg.text.strip()))
@@ -119,12 +120,27 @@ class STTEngine:
         )
 
 
+def confidence_summary(result: TranscriptionResult) -> tuple[float, float, str] | None:
+    """(평균 확신도, 확신도 0.5 미만 단어 비율(%), 판정). 확신도 정보가 없으면(예전 캐시) None.
+
+    소음을 섞어 잰 값: 깨끗한 음성 낮은 단어 약 2%, 소음 10dB 약 3%, 소음 3dB 12~15%(이때 인식 결과가
+    정답과 약 25% 어긋남). 실제 배경음악·겹치는 말소리는 다를 수 있으니 참고용 기준이다.
+    """
+    probs = [w.prob for w in result.words if w.prob is not None]
+    if not probs:
+        return None
+    avg = sum(probs) / len(probs)
+    low = sum(1 for p in probs if p < 0.5) / len(probs) * 100
+    label = "양호" if low < 5 else ("보통" if low < 10 else "불안정")
+    return avg, low, label
+
+
 def words_to_json(result: TranscriptionResult) -> dict:
     return {
         "language": result.language,
         "language_probability": result.language_probability,
         "duration": result.duration,
-        "words": [{"start": w.start, "end": w.end, "text": w.text} for w in result.words],
+        "words": [{"start": w.start, "end": w.end, "text": w.text, "prob": w.prob} for w in result.words],
     }
 
 

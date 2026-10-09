@@ -142,3 +142,28 @@ assert len(temps) == 2 and temps[1] > temps[0], f"재시도에서 온도가 안 
 assert any("Do not use these characters" in p for p, _ in fake.calls), "재시도에 avoid 힌트가 없음"
 
 print("말투/TranslateGemma 백엔드 테스트 통과")
+
+# ---- 음성 인식 확신도 요약 / 예전 캐시 호환 ----
+from core.stt import TranscriptionResult, Word, confidence_summary, words_from_json, words_to_json  # noqa: E402
+
+
+def _res(probs):
+    return TranscriptionResult(
+        words=[Word(start=i, end=i + 0.5, text="あ", prob=p) for i, p in enumerate(probs)],
+        language="ja", language_probability=1.0, duration=10.0,
+    )
+
+
+good = confidence_summary(_res([0.95] * 98 + [0.2, 0.3]))
+assert good and good[2] == "양호" and abs(good[1] - 2.0) < 1e-6, good
+mid = confidence_summary(_res([0.95] * 93 + [0.2] * 7))
+assert mid and mid[2] == "보통", mid
+bad = confidence_summary(_res([0.95] * 85 + [0.2] * 15))
+assert bad and bad[2] == "불안정", bad
+assert confidence_summary(_res([None, None])) is None, "확신도가 없으면 None이어야 함"
+# 확신도가 저장되고, 예전 캐시(prob 키 없음)도 그대로 읽힌다
+assert words_from_json(words_to_json(_res([0.9, 0.4]))).words[1].prob == 0.4
+old_cache = {"language": "ja", "language_probability": 1.0, "duration": 5.0, "words": [{"start": 0, "end": 1, "text": "あ"}]}
+assert words_from_json(old_cache).words[0].prob is None
+
+print("음성 인식 확신도 테스트 통과")

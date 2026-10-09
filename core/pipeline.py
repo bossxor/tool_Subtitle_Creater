@@ -18,7 +18,7 @@ from core.audio import extract_audio
 from core.errors import PipelineCancelled
 from core.llm import LlamaServer
 from core.segmenter import Cue, build_cues, cues_from_json, cues_to_json
-from core.stt import STTEngine, words_from_json, words_to_json
+from core.stt import STTEngine, confidence_summary, words_from_json, words_to_json
 from core.translate import translate_cues
 from core.translate_gemma import translate_cues_gemma
 from core.worklog import WorkLog
@@ -97,6 +97,18 @@ def predict_output_paths(videos: list[str | Path], out_dir: str | Path, config) 
     return result
 
 
+def _confidence_text(result) -> str:
+    """작업 로그용: 음성 인식이 얼마나 불안했는지. 번역이 이상할 때 원인이 인식인지 번역인지 가리는 단서."""
+    summary = confidence_summary(result)
+    if summary is None:
+        return ""
+    avg, low, label = summary
+    text = f", 인식 확신도 평균 {avg:.2f}, 낮은 단어 {low:.1f}% ({label})"
+    if label == "불안정":
+        text += " - 배경음·겹치는 말소리 때문에 인식이 불안정함. 번역이 이상하면 번역보다 음성 인식이 원인일 가능성이 큼"
+    return text
+
+
 def stage_audio(
     videos: list[Path],
     config,
@@ -143,7 +155,10 @@ def stage_stt(
         if cache_file.exists():
             results[v] = words_from_json(json.loads(cache_file.read_text(encoding="utf-8")))
             if worklog:
-                worklog.event("음성 인식", v.name, "캐시 사용", f"단어 {len(results[v].words)}개 (이전 결과 재사용)")
+                worklog.event(
+                    "음성 인식", v.name, "캐시 사용",
+                    f"단어 {len(results[v].words)}개 (이전 결과 재사용){_confidence_text(results[v])}",
+                )
             if tracker:
                 tracker.add(STAGE_WEIGHTS["stt"])
             continue
@@ -158,7 +173,8 @@ def stage_stt(
         if worklog:
             worklog.event(
                 "음성 인식", v.name, "완료",
-                f"모델 {precision}, 감지 언어 {res.language}, 단어 {len(res.words)}개, 길이 {res.duration / 60:.1f}분",
+                f"모델 {precision}, 감지 언어 {res.language}, 단어 {len(res.words)}개, 길이 {res.duration / 60:.1f}분"
+                f"{_confidence_text(res)}",
             )
         if tracker:
             tracker.add(STAGE_WEIGHTS["stt"])
