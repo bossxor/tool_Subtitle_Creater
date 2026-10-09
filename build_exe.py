@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import PyInstaller.__main__
@@ -77,6 +78,15 @@ def collect_nvidia_binaries() -> list[str]:
 
 
 def main() -> None:
+    executable = DIST_APP / "Subtitle_Tool.exe"
+    if executable.exists():
+        try:
+            # Windows denies write access to a running executable. Probe before
+            # moving model junctions, which a running inference still needs.
+            with executable.open("r+b"):
+                pass
+        except PermissionError as e:
+            raise SystemExit("Subtitle Tool이 실행 중이거나 실행 파일이 잠겨 있습니다. 종료 후 다시 빌드하세요.") from e
     args = [
         str(ROOT / "main.py"),
         "--name",
@@ -98,9 +108,21 @@ def main() -> None:
 
     print(f"nvidia DLL {len(collect_nvidia_binaries()) // 2}개 포함, 빌드 시작...")
     saved = preserve_user_data()
+    original_path = os.environ.get("PATH", "")
+    # Dependency discovery must not pick an unrelated ICU/Qt DLL from a tool
+    # injected into PATH (e.g. Poppler's icuuc.dll exports versioned symbols,
+    # while Qt uses the Windows ICU API). Keep the build search path explicit.
+    windows_dir = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    os.environ["PATH"] = os.pathsep.join(map(str, [
+        Path(sys.executable).parent,
+        windows_dir / "System32",
+        windows_dir,
+        VENV_SITE / "PySide6",
+    ]))
     try:
         PyInstaller.__main__.run(args)
     finally:
+        os.environ["PATH"] = original_path
         # 빌드가 실패해도 사용자 데이터는 반드시 되돌린다
         DIST_APP.mkdir(parents=True, exist_ok=True)
         restore_user_data(saved)

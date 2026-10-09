@@ -68,8 +68,40 @@ def _check_cancel(cancel_check: CancelCheck) -> None:
 def cache_dir_for(video_path: Path, config) -> Path:
     root = config.resolve_path("paths.cache_dir", "cache")
     video_path = Path(video_path)
-    h = hashlib.sha1(str(video_path.resolve()).encode("utf-8")).hexdigest()[:8]
+    stat = video_path.stat()
+    identity = f"{video_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+    h = hashlib.sha1(identity.encode("utf-8")).hexdigest()[:12]
     return root / f"{video_path.stem}_{h}"
+
+
+def _fingerprint(value) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _stt_cache_file(video: Path, config) -> Path:
+    precision = config.get("stt.precision", "turbo")
+    key = _fingerprint({"version": 1, "stt": config.get("stt", {}),
+                        "source_language": config.get("source_language")})
+    return cache_dir_for(video, config) / f"raw_words.{precision}.{key}.json"
+
+
+def _translation_cache_file(video: Path, cues: list[Cue], config, glossary) -> Path:
+    key = _fingerprint({"version": 1, "cues": cues_to_json(cues),
+                        "llm": config.get("llm", {}), "glossary": glossary or {},
+                        "source": config.get("source_language"),
+                        "target": config.get("target_language")})
+    return cache_dir_for(video, config) / f"cues_translated.{config.get('target_language')}.{key}.json"
+
+
+def _write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".json.tmp")
+    try:
+        temporary.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 #  지원하는 자막 포맷. 키가 config의 subtitle.formats에 쓰는 이름이자 그대로 파일 확장자가 된다.
@@ -122,7 +154,10 @@ def stage_audio(
         _report(progress_cb, f"[오디오 추출 {i}/{len(videos)}] {v.name}")
         cd = cache_dir_for(v, config)
         wav = cd / "audio.wav"
-        extract_audio(v, wav)
+        # Completed recognition needs no WAV. Avoid extracting hours of audio again
+        # when only translation/output options changed and audio was cleaned up.
+        if not _stt_cache_file(v, config).exists():
+            extract_audio(v, wav)
         wav_paths[v] = wav
         if tracker:
             tracker.add(STAGE_WEIGHTS["audio"])
@@ -150,8 +185,7 @@ def stage_stt(
     engine: STTEngine | None = None
     for i, v in enumerate(videos, 1):
         _check_cancel(cancel_check)
-        cd = cache_dir_for(v, config)
-        cache_file = cd / f"raw_words.{precision}.json"
+        cache_file = _stt_cache_file(v, config)
         if cache_file.exists():
             results[v] = words_from_json(json.loads(cache_file.read_text(encoding="utf-8")))
             if worklog:
@@ -167,8 +201,7 @@ def stage_stt(
             engine = STTEngine(model_dir, device=device, compute_type=compute_type)
         _report(progress_cb, f"[음성 인식 {i}/{len(videos)}] {v.name}")
         res = engine.transcribe(wav_paths[v], language=source_lang, batch_size=batch_size, beam_size=beam_size)
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        cache_file.write_text(json.dumps(words_to_json(res), ensure_ascii=False), encoding="utf-8")
+        _write_json(cache_file, words_to_json(res))
         results[v] = res
         if worklog:
             worklog.event(
@@ -196,7 +229,9 @@ def stage_segment(
         _check_cancel(cancel_check)
         cd = cache_dir_for(v, config)
         # STT 정밀도(모델)가 바뀌면 단어 타임스탬프가 달라지므로 세그먼트도 다시 만들어야 한다
-        cache_file = cd / f"cues_source.{precision}.json"
+        key = _fingerprint({"version": 1, "words": words_to_json(stt_results[v]),
+                            "segmenter": config.get("segmenter", {})})
+        cache_file = cd / f"cues_source.{precision}.{key}.json"
         if cache_file.exists():
             results[v] = cues_from_json(json.loads(cache_file.read_text(encoding="utf-8")))
             if worklog:
@@ -206,8 +241,7 @@ def stage_segment(
             continue
         _report(progress_cb, f"[세그먼트 구성 {i}/{len(videos)}] {v.name}")
         cues = build_cues(stt_results[v].words, config)
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        cache_file.write_text(json.dumps(cues_to_json(cues), ensure_ascii=False, indent=1), encoding="utf-8")
+        _write_json(cache_file, cues_to_json(cues))
         results[v] = cues
         if worklog:
             worklog.event("자막 구간 나누기", v.name, "완료", f"{len(cues)}줄")
@@ -266,6 +300,7 @@ def stage_translate(
 
     if source_lang == target_lang:
         for v in videos:
+            _check_cancel(cancel_check)
             results[v] = {c.id: c.text for c in cues_map[v]}
             if worklog:
                 worklog.event("번역", v.name, "건너뜀", "원어와 번역 대상 언어가 같아 번역하지 않음")
@@ -275,8 +310,13 @@ def stage_translate(
 
     pending = []
     for v in videos:
-        cache_file = cache_dir_for(v, config) / f"cues_translated.{target_lang}.json"
-        if cache_file.exists():
+        _check_cancel(cancel_check)
+        cache_file = _translation_cache_file(v, cues_map[v], config, glossary)
+        if not cues_map[v]:
+            results[v] = {}
+            if tracker:
+                tracker.add(translate_weight)
+        elif cache_file.exists():
             raw = json.loads(cache_file.read_text(encoding="utf-8"))
             results[v] = {int(k): val for k, val in raw.items()}
             if worklog:
@@ -343,16 +383,8 @@ def stage_translate(
                 if restarts:
                     detail += f", 번역 서버가 응답하지 않아 {restarts}번 다시 시작함(GPU 메모리 부족 의심)"
                 worklog.event("번역", v.name, "완료" if not report.failed_ids else "일부 미번역", detail)
-            if tracker and n_cues == 0:
-                # translate_cues가 빈 목록은 배치를 만들지 않고 바로 반환해 on_batch_done이
-                # 한 번도 안 불리므로, 이 영상 몫은 여기서 대신 채워준다.
-                tracker.add(per_batch_weight)
-            cache_file = cache_dir_for(v, config) / f"cues_translated.{target_lang}.json"
-            cache_file.parent.mkdir(parents=True, exist_ok=True)
-            cache_file.write_text(
-                json.dumps({str(k): val for k, val in ko_map.items()}, ensure_ascii=False, indent=1),
-                encoding="utf-8",
-            )
+            cache_file = _translation_cache_file(v, cues_map[v], config, glossary)
+            _write_json(cache_file, {str(k): val for k, val in ko_map.items()})
             results[v] = ko_map
     finally:
         server.stop()
@@ -368,6 +400,7 @@ def stage_write(
     progress_cb: ProgressCB = None,
     tracker: Optional[ProgressTracker] = None,
     worklog: Optional[WorkLog] = None,
+    cancel_check: CancelCheck = None,
 ) -> dict[Path, list[Path]]:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -397,6 +430,7 @@ def stage_write(
 
     outputs: dict[Path, list[Path]] = {}
     for i, v in enumerate(videos, 1):
+        _check_cancel(cancel_check)
         _report(progress_cb, f"[자막 저장 {i}/{len(videos)}] {v.name}")
         stem = Path(v).stem
         current_video["name"] = Path(v).name
@@ -453,7 +487,8 @@ def run_batch(
         translations = stage_translate(
             videos, cues_map, config, glossary, progress_cb, cancel_check, tracker, worklog
         )
-        outputs = stage_write(videos, cues_map, translations, out_dir, config, progress_cb, tracker, worklog)
+        _check_cancel(cancel_check)
+        outputs = stage_write(videos, cues_map, translations, out_dir, config, progress_cb, tracker, worklog, cancel_check)
     except PipelineCancelled:
         if worklog:
             worklog.note("사용자가 취소함. 이미 끝난 단계는 캐시에 남아 있어 이어서 할 수 있음")

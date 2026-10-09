@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 from pathlib import Path
 
 from core.procutil import NO_WINDOW_FLAGS
@@ -22,6 +23,9 @@ def extract_audio(video_path: Path, out_wav: Path, sample_rate: int = 16000) -> 
         return out_wav
 
     out_wav.parent.mkdir(parents=True, exist_ok=True)
+    # Publish only a complete WAV: ffmpeg can leave a nonempty partial file on failure.
+    with tempfile.NamedTemporaryFile(dir=out_wav.parent, suffix=".wav", delete=False) as f:
+        temporary = Path(f.name)
     cmd = [
         "ffmpeg",
         "-y",
@@ -34,13 +38,17 @@ def extract_audio(video_path: Path, out_wav: Path, sample_rate: int = 16000) -> 
         str(sample_rate),
         "-ac",
         "1",
-        str(out_wav),
+        str(temporary),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, creationflags=NO_WINDOW_FLAGS)
-    if result.returncode != 0:
-        raise AudioExtractionError(
-            f"ffmpeg 오디오 추출 실패: {video_path}\n{result.stderr.strip()}"
-        )
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, creationflags=NO_WINDOW_FLAGS)
+        if result.returncode != 0:
+            raise AudioExtractionError(
+                f"ffmpeg 오디오 추출 실패: {video_path}\n{result.stderr.strip()}"
+            )
+        temporary.replace(out_wav)
+    finally:
+        temporary.unlink(missing_ok=True)
     return out_wav
 
 

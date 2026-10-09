@@ -98,6 +98,8 @@ def translate_cues_gemma(
         bad = ""
         latin_fallback: str | None = None
         for attempt in range(max_retries):
+            if cancel_check is not None and cancel_check():
+                raise PipelineCancelled()
             hint = base_hint
             if bad:
                 hint = (hint + f" Do not use these characters: {bad}. Write everything in Hangul.").strip()

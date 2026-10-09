@@ -34,30 +34,34 @@ result = {"ok": False, "outputs": None, "error": None}
 orig_finished = win._on_finished_ok
 orig_failed = win._on_failed
 orig_cancelled = win._on_cancelled
+orig_stopped = win._on_worker_stopped
 
 
 def wrapped_finished(outputs):
     orig_finished(outputs)
     result["ok"] = True
     result["outputs"] = outputs
-    app.quit()
 
 
 def wrapped_failed(msg):
     orig_failed(msg)
     result["error"] = msg
-    app.quit()
 
 
 def wrapped_cancelled():
     orig_cancelled()
     result["error"] = "unexpected cancel"
+
+
+def wrapped_stopped():
+    orig_stopped()
     app.quit()
 
 
 win._on_finished_ok = wrapped_finished
 win._on_failed = wrapped_failed
 win._on_cancelled = wrapped_cancelled
+win._on_worker_stopped = wrapped_stopped
 
 win._on_start()  # 내부적으로 (재정의된) 콜백들을 worker.start() 전에 connect한다
 print("worker running:", win.worker.isRunning() if win.worker else None)

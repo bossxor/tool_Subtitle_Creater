@@ -30,6 +30,8 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QScrollArea,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -44,126 +46,7 @@ from gui.folder_worker import FolderCleanupWorker
 from gui.progress_model import EtaEstimator, StageTracker, format_duration, format_remaining
 from gui.worker import PipelineWorker
 
-STYLE_SHEET = """
-QMainWindow, QWidget#root {
-    background: #f4f5f8;
-}
-QLabel {
-    color: #2b2d33;
-}
-QGroupBox {
-    background: #ffffff;
-    border: 1px solid #e2e4ea;
-    border-radius: 10px;
-    margin-top: 22px;
-    padding: 14px 12px 12px 12px;
-    font-weight: normal;
-    color: #2b2d33;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    subcontrol-position: top left;
-    left: 12px;
-    top: -4px;
-    padding: 0 6px;
-    font-weight: 600;
-    color: #3457d5;
-}
-QListWidget, QPlainTextEdit, QTableWidget, QLineEdit {
-    background: #fbfbfd;
-    border: 1px solid #dfe2e8;
-    border-radius: 6px;
-    padding: 4px;
-    selection-background-color: #3457d5;
-    selection-color: white;
-}
-QTableWidget QHeaderView::section {
-    background: #eef0f5;
-    border: none;
-    padding: 4px;
-    font-weight: 600;
-}
-QTabWidget::pane {
-    border: 1px solid #e2e4ea;
-    border-radius: 8px;
-    background: #ffffff;
-}
-QTabBar::tab {
-    background: #eef0f5;
-    border: 1px solid #e2e4ea;
-    border-bottom: none;
-    border-top-left-radius: 6px;
-    border-top-right-radius: 6px;
-    padding: 6px 16px;
-    margin-right: 2px;
-    color: #4b5160;
-}
-QTabBar::tab:selected {
-    background: #ffffff;
-    color: #3457d5;
-    font-weight: 600;
-}
-QPushButton {
-    background: #ffffff;
-    border: 1px solid #d7dae1;
-    border-radius: 6px;
-    padding: 7px 16px;
-    color: #2b2d33;
-}
-QPushButton:hover {
-    background: #f0f2f7;
-    border-color: #b9c0cf;
-}
-QPushButton:disabled {
-    color: #a7abb6;
-    background: #f4f5f8;
-}
-QPushButton#primaryButton {
-    background: #3457d5;
-    border: 1px solid #3457d5;
-    color: white;
-    font-weight: 600;
-    padding: 9px 18px;
-}
-QPushButton#primaryButton:hover {
-    background: #2c49b8;
-}
-QPushButton#primaryButton:disabled {
-    background: #aab7ea;
-    border-color: #aab7ea;
-    color: #f0f2f7;
-}
-QPushButton#dangerButton {
-    color: #c23b3b;
-    border-color: #eac6c6;
-}
-QPushButton#dangerButton:hover {
-    background: #fbebeb;
-    border-color: #e39a9a;
-}
-QComboBox {
-    background: #fbfbfd;
-    border: 1px solid #dfe2e8;
-    border-radius: 6px;
-    padding: 4px 8px;
-    min-height: 22px;
-}
-QCheckBox {
-    spacing: 8px;
-}
-QProgressBar {
-    background: #eef0f5;
-    border: none;
-    border-radius: 7px;
-    height: 14px;
-    text-align: center;
-    color: #2b2d33;
-}
-QProgressBar::chunk {
-    background: #3457d5;
-    border-radius: 7px;
-}
-"""
+from gui.theme import STYLE_SHEET
 
 # 진행 메시지 형식: "[단계 k/N] 파일명" (core/pipeline.py, core/folder_scan.py 에서 만든다)
 
@@ -180,13 +63,12 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Subtitle Tool - 영상 자막 자동 생성")
-        self.resize(900, 1000)
-        # 내용물이 실제로 필요로 하는 최소 높이(minimumSizeHint, 보통 ~860px)보다 작게 잡으면
-        # Qt가 각 영역을 강제로 쥐어짜서 글자가 겹쳐 보인다. 넉넉하게 잡는다.
-        self.setMinimumSize(760, 880)
+        self.resize(1240, 840)
+        self.setMinimumSize(980, 640)
         self.setAcceptDrops(True)
         self.setStyleSheet(STYLE_SHEET)
 
+        self._close_pending = False
         self.worker: PipelineWorker | None = None
         self.tracker = StageTracker()
         self._t0 = 0.0
@@ -200,11 +82,56 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
-        layout.addWidget(self._build_file_section())
-        layout.addWidget(self._build_output_section())
-        layout.addWidget(self._build_options_section())
-        layout.addLayout(self._build_action_section())
-        layout.addWidget(self._build_progress_section())
+        hero = QWidget()
+        hero.setObjectName("hero")
+        hero_layout = QHBoxLayout(hero)
+        hero_layout.setContentsMargins(24, 18, 24, 18)
+        intro = QVBoxLayout()
+        eyebrow = QLabel("SUBTITLE WORKSPACE")
+        eyebrow.setObjectName("eyebrow")
+        title = QLabel("영상의 이야기를, 자막으로")
+        title.setObjectName("heroTitle")
+        description = QLabel("영상을 담고 언어를 선택하면, 나머지는 Subtitle Tool이 준비합니다.")
+        description.setObjectName("heroDescription")
+        intro.addWidget(eyebrow)
+        intro.addWidget(title)
+        intro.addWidget(description)
+        hero_layout.addLayout(intro)
+        hero_layout.addStretch()
+        badge = QLabel("내 PC에서 실행 · API 비용 0")
+        badge.setObjectName("badge")
+        hero_layout.addWidget(badge)
+        layout.addWidget(hero)
+
+        workspace = QSplitter(Qt.Horizontal)
+        settings_panel = QWidget()
+        settings_layout = QVBoxLayout(settings_panel)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        content.setObjectName("settingsContent")
+        self.settings_content = content
+        cards = QVBoxLayout(content)
+        cards.setContentsMargins(0, 0, 6, 0)
+        cards.setSpacing(12)
+        self.file_section = self._build_file_section()
+        self.output_section = self._build_output_section()
+        self.options_section = self._build_options_section()
+        cards.addWidget(self.file_section)
+        cards.addWidget(self.output_section)
+        cards.addWidget(self.options_section)
+        cards.addStretch()
+        scroll.setWidget(content)
+        settings_layout.addWidget(scroll)
+        settings_layout.addLayout(self._build_action_section())
+        workspace.addWidget(settings_panel)
+        workspace.addWidget(self._build_progress_section())
+        workspace.setChildrenCollapsible(False)
+        workspace.setSizes([720, 460])
+        layout.addWidget(workspace, 1)
+        self._load_config_options()
+        self._update_file_count()
 
     # ---------- UI 구성 ----------
 
@@ -215,7 +142,15 @@ class MainWindow(QMainWindow):
 
         self.file_list = QListWidget()
         self.file_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        v.addWidget(QLabel("영상 파일을 여기로 끌어다 놓거나 아래 버튼으로 추가하세요."))
+        tip = QLabel("영상 파일을 끌어다 놓거나, 폴더를 한 번에 추가하세요.")
+        tip.setObjectName("muted")
+        v.addWidget(tip)
+        self.empty_state = QLabel("아직 담긴 영상이 없어요\n영상 추가 버튼으로 첫 작업을 시작해 보세요.")
+        self.empty_state.setObjectName("emptyState")
+        self.empty_state.setAlignment(Qt.AlignCenter)
+        v.addWidget(self.empty_state)
+        self.file_list.setMinimumHeight(110)
+        self.file_list.setMaximumHeight(170)
         v.addWidget(self.file_list)
 
         btn_row = QHBoxLayout()
@@ -245,7 +180,7 @@ class MainWindow(QMainWindow):
         return box
 
     def _build_output_section(self) -> QGroupBox:
-        box = QGroupBox("2. 자막 저장 폴더")
+        box = QGroupBox("02  저장할 곳")
         h = QHBoxLayout(box)
         self.out_dir_edit = QLineEdit()
         self.out_dir_edit.setPlaceholderText("자막 파일이 저장될 폴더를 선택하세요")
@@ -256,7 +191,7 @@ class MainWindow(QMainWindow):
         return box
 
     def _build_options_section(self) -> QGroupBox:
-        box = QGroupBox("3. 옵션")
+        box = QGroupBox("03  자막 설정")
         outer = QVBoxLayout(box)
         tabs = QTabWidget()
         outer.addWidget(tabs)
@@ -300,11 +235,11 @@ class MainWindow(QMainWindow):
 
         fmt_label = QLabel("자막 형식:")
         fmt_label.setToolTip("체크한 형식마다 자막 파일이 하나씩 따로 생성됩니다. 보통은 하나만 선택하세요.")
-        self.format_srt_chk = QCheckBox("srt (기본, 가장 호환성 좋음)")
+        self.format_srt_chk = QCheckBox("SRT · 기본")
         self.format_srt_chk.setChecked(True)
-        self.format_ass_chk = QCheckBox("ass (스타일링 가능)")
+        self.format_ass_chk = QCheckBox("ASS · 스타일")
         self.format_ass_chk.setChecked(False)
-        self.format_smi_chk = QCheckBox("smi (곰플레이어 구버전 호환용)")
+        self.format_smi_chk = QCheckBox("SMI · 구버전 호환")
         self.format_smi_chk.setChecked(False)
         form.addWidget(_row(fmt_label, self.format_srt_chk, self.format_ass_chk, self.format_smi_chk))
 
@@ -356,8 +291,10 @@ class MainWindow(QMainWindow):
         box = QGroupBox("진행 상황")
         v = QVBoxLayout(box)
         self.count_label = QLabel("")
-        self.count_label.setStyleSheet("font-weight: 600; color: #3457d5;")
-        self.status_label = QLabel("대기 중")
+        self.count_label.setStyleSheet("font-weight: 600; color: #367e5e;")
+        self.status_label = QLabel("준비되면 시작해 주세요")
+        self.status_label.setWordWrap(True)
+        self.count_label.setWordWrap(True)
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -374,6 +311,7 @@ class MainWindow(QMainWindow):
         self.clock.timeout.connect(self._refresh_time)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
+        self.log_view.setPlaceholderText("작업을 시작하면 이곳에 진행 기록이 쌓입니다.\n완료된 자막은 결과 탭에서 확인하세요.")
         self.log_view.setMaximumBlockCount(5000)
         self.result_table = QTableWidget(0, 4)
         self.result_table.setHorizontalHeaderLabels(["구분", "파일", "상태", "결과"])
@@ -386,10 +324,31 @@ class MainWindow(QMainWindow):
         v.addWidget(self.status_label)
         v.addWidget(self.progress_bar)
         v.addWidget(self.time_label)
-        v.addWidget(self.log_view)
-        v.addWidget(self.result_title)
-        v.addWidget(self.result_table)
+        self.progress_tabs = QTabWidget()
+        self.progress_tabs.addTab(self.log_view, "작업 로그")
+        self.progress_tabs.addTab(self.result_table, "결과 · 0")
+        self.result_table.setVisible(True)
+        v.addWidget(self.progress_tabs, 1)
+        self.result_table.setWordWrap(False)
+        self.result_table.verticalHeader().setVisible(False)
+        self.result_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.result_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         return box
+
+    def _load_config_options(self) -> None:
+        config = Config.load(DEFAULT_CONFIG_PATH)
+        for combo, key in ((self.source_lang_combo, "source_language"),
+                           (self.target_lang_combo, "target_language"),
+                           (self.precision_combo, "stt.precision")):
+            index = combo.findData(config.get(key))
+            if index >= 0:
+                combo.setCurrentIndex(index)
+        formats = config.get("subtitle.formats", ["srt"])
+        for checkbox, fmt in ((self.format_srt_chk, "srt"), (self.format_ass_chk, "ass"),
+                              (self.format_smi_chk, "smi")):
+            checkbox.setChecked(fmt in formats)
+        self.emit_source_chk.setChecked(config.get("subtitle.emit_source", False))
+        self.bilingual_chk.setChecked(config.get("subtitle.bilingual", False))
 
     def _refresh_counts(self) -> None:
         self.count_label.setText("\n".join(self.tracker.lines()))
@@ -418,15 +377,15 @@ class MainWindow(QMainWindow):
 
     def _show_results(self, rows: list[tuple[str, str, str, str]]) -> None:
         """rows: (구분, 파일, 상태, 결과) 목록을 결과 표에 채운다."""
-        self.result_table.setRowCount(0)
-        for kind, name, status, detail in rows:
-            r = self.result_table.rowCount()
-            self.result_table.insertRow(r)
+        self.result_table.setRowCount(len(rows))
+        for r, (kind, name, status, detail) in enumerate(rows):
             for c, text in enumerate((kind, name, status, detail)):
-                self.result_table.setItem(r, c, QTableWidgetItem(text))
-        self.result_table.resizeColumnsToContents()
-        self.result_table.setVisible(bool(rows))
-        self.result_title.setVisible(bool(rows))
+                item = QTableWidgetItem(text)
+                item.setToolTip(text)
+                self.result_table.setItem(r, c, item)
+        self.progress_tabs.setTabText(1, f"결과 · {len(rows)}")
+        if rows:
+            self.progress_tabs.setCurrentIndex(1)
 
     def _elapsed_text(self) -> str:
         return format_duration(time.monotonic() - self._t0 if self._t0 else 0)
@@ -480,7 +439,10 @@ class MainWindow(QMainWindow):
         self._update_file_count()
 
     def _update_file_count(self) -> None:
-        self.file_box.setTitle(f"1. 자막을 만들 영상 선택 (총 {self.file_list.count()}개)")
+        count = self.file_list.count()
+        self.file_box.setTitle(f"01  영상 담기 · {count}개")
+        self.empty_state.setVisible(count == 0)
+        self.file_list.setVisible(count > 0)
 
     def _on_remove_selected(self) -> None:
         for item in self.file_list.selectedItems():
@@ -618,15 +580,14 @@ class MainWindow(QMainWindow):
             self.tracker.finish_all()
             dlg.setValue(max(total, 1))
             result["ok"] = (converted, fixed, deleted)
-            loop.quit()
 
         def on_cancelled() -> None:
-            loop.quit()
+            pass
 
         def on_failed(msg: str) -> None:
             QMessageBox.critical(self, "폴더 정리 실패", f"정리 중 오류가 발생했습니다:\n{msg}")
-            loop.quit()
 
+        worker.finished.connect(loop.quit)
         worker.progress.connect(on_progress)
         worker.finished_ok.connect(on_finished)
         worker.cancelled.connect(on_cancelled)
@@ -643,7 +604,7 @@ class MainWindow(QMainWindow):
             self._clock_dialog = None
             self._stop_clock()
         dlg.close()
-        worker.wait(5000)
+        worker.wait()
         return result["ok"] if result["ok"] is not None else (None, None, None)
 
     def _on_browse_out_dir(self) -> None:
@@ -749,6 +710,9 @@ class MainWindow(QMainWindow):
         self._current_videos = videos
         self._start_clock()
         self._show_results([])
+        self.progress_tabs.setCurrentIndex(0)
+        self.settings_content.setEnabled(False)
+        self.setAcceptDrops(False)
         self._refresh_counts()
         self.status_label.setText("시작하는 중...")
         self.progress_bar.setValue(0)
@@ -756,7 +720,8 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
 
-        self.worker = PipelineWorker(videos, out_dir, config, glossary=glossary)
+        self.worker = PipelineWorker(videos, out_dir, config, glossary=glossary, parent=self)
+        self.worker.finished.connect(self._on_worker_stopped)
         self.worker.progress.connect(self._on_progress)
         self.worker.progress_fraction.connect(self._on_progress_fraction)
         self.worker.log.connect(self.log_view.appendPlainText)
@@ -791,15 +756,14 @@ class MainWindow(QMainWindow):
 
         def on_finished() -> None:
             result["ok"] = True
-            loop.quit()
 
         def on_cancelled() -> None:
-            loop.quit()
+            pass
 
         def on_failed(msg: str) -> None:
             QMessageBox.critical(self, "다운로드 실패", f"필요한 파일을 받는 중 오류가 발생했습니다:\n{msg}")
-            loop.quit()
 
+        worker.finished.connect(loop.quit)
         worker.progress.connect(on_progress)
         worker.finished_ok.connect(on_finished)
         worker.cancelled.connect(on_cancelled)
@@ -810,7 +774,7 @@ class MainWindow(QMainWindow):
         dlg.show()
         loop.exec()
         dlg.close()
-        worker.wait(5000)
+        worker.wait()
         return result["ok"]
 
     def _on_cancel(self) -> None:
@@ -822,7 +786,6 @@ class MainWindow(QMainWindow):
         if self.tracker.update(message):
             self._refresh_counts()
         self.status_label.setText(message)
-        self.log_view.appendPlainText(message)
 
     def _on_progress_fraction(self, fraction: float) -> None:
         self.progress_bar.setValue(round(fraction * 100))
@@ -831,10 +794,18 @@ class MainWindow(QMainWindow):
 
     def _reset_run_state(self) -> None:
         self._stop_clock()
-        self.progress_bar.setVisible(False)
-        self.start_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
+
+    def _on_worker_stopped(self) -> None:
+        worker = self.worker
         self.worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self.start_btn.setEnabled(True)
+        self.settings_content.setEnabled(True)
+        self.setAcceptDrops(True)
+        if self._close_pending:
+            QTimer.singleShot(0, self.close)
 
     def _on_finished_ok(self, outputs: dict) -> None:
         self.status_label.setText("완료")
@@ -854,7 +825,8 @@ class MainWindow(QMainWindow):
         self.log_view.appendPlainText("\n".join(lines))
         self._show_results(rows)
         self._reset_run_state()
-        QMessageBox.information(self, "완료", "자막 생성이 끝났습니다.")
+        if not self._close_pending:
+            QMessageBox.information(self, "완료", "자막 생성이 끝났습니다.")
 
     def _on_cancelled(self) -> None:
         self.status_label.setText("취소됨")
@@ -869,10 +841,14 @@ class MainWindow(QMainWindow):
         )
         self.log_view.appendPlainText(f"오류: {message}")
         self._reset_run_state()
-        QMessageBox.critical(self, "오류", f"자막 생성 중 오류가 발생했습니다:\n{message}")
+        if not self._close_pending:
+            QMessageBox.critical(self, "오류", f"자막 생성 중 오류가 발생했습니다:\n{message}")
 
     def closeEvent(self, event) -> None:
         if self.worker is not None and self.worker.isRunning():
+            if self._close_pending:
+                event.ignore()
+                return
             reply = QMessageBox.question(
                 self,
                 "종료 확인",
@@ -882,6 +858,9 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.Yes:
                 event.ignore()
                 return
-            self.worker.request_cancel()
-            self.worker.wait(15000)
+            self._close_pending = True
+            self._on_cancel()
+            self.status_label.setText("작업을 정리한 뒤 창을 닫습니다…")
+            event.ignore()
+            return
         event.accept()

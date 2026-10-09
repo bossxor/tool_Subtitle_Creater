@@ -75,7 +75,7 @@ def _fetch_whisper_model(repo: str, out_dir: Path, label: str) -> Callable[[Prog
     def _fetch(progress_cb: ProgressCB) -> None:
         for fname in WHISPER_FILES:
             dest = out_dir / fname
-            if dest.exists():
+            if dest.is_file() and dest.stat().st_size > 0:
                 continue
             _download_file(_hf_url(repo, fname), dest, f"{label}: {fname}", progress_cb)
 
@@ -123,7 +123,8 @@ def list_missing(config, include_verify_model: bool = False) -> list[AssetTask]:
 
     precision = config.get("stt.precision", "turbo")
     model_dir = config.resolve_path(f"stt.models.{precision}")
-    if not (model_dir / "model.bin").exists():
+    if not all((model_dir / name).is_file() and (model_dir / name).stat().st_size > 0
+               for name in WHISPER_FILES):
         repo = HF_WHISPER_REPO.get(precision, HF_WHISPER_REPO["turbo"])
         tasks.append(
             AssetTask(
