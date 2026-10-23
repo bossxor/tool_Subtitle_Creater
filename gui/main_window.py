@@ -8,8 +8,8 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QEventLoop, Qt, QTimer
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtCore import QEventLoop, QSettings, Qt, QTimer
+from PySide6.QtGui import QBrush, QDragEnterEvent, QDropEvent, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -47,7 +47,14 @@ from gui.folder_picker import FolderPickerDialog, VIDEO_EXTENSIONS
 from gui.progress_model import EtaEstimator, StageTracker, format_duration, format_remaining
 from gui.worker import PipelineWorker
 
-from gui.theme import STYLE_SHEET
+from gui.theme import (
+    MODE_LABELS,
+    MODE_ORDER,
+    STATUS_STYLE,
+    apply_theme,
+    resolve_mode,
+    status_colors,
+)
 
 # 진행 메시지 형식: "[단계 k/N] 파일명" (core/pipeline.py, core/folder_scan.py 에서 만든다)
 
@@ -65,7 +72,11 @@ class MainWindow(QMainWindow):
         self.resize(1240, 840)
         self.setMinimumSize(980, 640)
         self.setAcceptDrops(True)
-        self.setStyleSheet(STYLE_SHEET)
+        self._settings = QSettings("SubtitleTool", "SubtitleTool")
+        pref = str(self._settings.value("theme", "auto"))
+        self._theme_pref = pref if pref in MODE_ORDER else "auto"
+        self._theme_mode = "light"
+        self._result_rows: list[tuple[str, str, str, str]] = []
 
         self._close_pending = False
         self.worker: PipelineWorker | None = None
@@ -100,6 +111,11 @@ class MainWindow(QMainWindow):
         badge = QLabel("내 PC에서 실행 · API 비용 0")
         badge.setObjectName("badge")
         hero_layout.addWidget(badge)
+        self.theme_btn = QPushButton()
+        self.theme_btn.setObjectName("themeButton")
+        self.theme_btn.setCursor(Qt.PointingHandCursor)
+        self.theme_btn.clicked.connect(self._cycle_theme)
+        hero_layout.addWidget(self.theme_btn)
         layout.addWidget(hero)
 
         workspace = QSplitter(Qt.Horizontal)
@@ -127,10 +143,33 @@ class MainWindow(QMainWindow):
         workspace.addWidget(settings_panel)
         workspace.addWidget(self._build_progress_section())
         workspace.setChildrenCollapsible(False)
-        workspace.setSizes([720, 460])
+        workspace.setSizes([640, 600])
         layout.addWidget(workspace, 1)
         self._load_config_options()
         self._update_file_count()
+        self._apply_theme()
+        try:  # 자동 모드에서는 Windows의 라이트/다크 설정이 바뀌면 바로 따라간다
+            QGuiApplication.styleHints().colorSchemeChanged.connect(lambda *_: self._apply_theme())
+        except AttributeError:  # Qt 6.5 미만
+            pass
+
+    # ---------- 화면 모드 (라이트/다크) ----------
+
+    def _apply_theme(self) -> None:
+        self._theme_mode = resolve_mode(self._theme_pref)
+        apply_theme(self._theme_mode)
+        label = MODE_LABELS[self._theme_pref]
+        if self._theme_pref == "auto":
+            label += f" ({MODE_LABELS[self._theme_mode]})"
+        self.theme_btn.setText(f"화면 모드: {label}")
+        self.theme_btn.setToolTip("누를 때마다 자동 → 라이트 → 다크 순서로 바뀝니다.\n자동은 Windows 설정을 따릅니다.")
+        self._show_results(self._result_rows, switch_tab=False)  # 상태 색을 새 테마로 다시 입힌다
+
+    def _cycle_theme(self) -> None:
+        nxt = MODE_ORDER[(MODE_ORDER.index(self._theme_pref) + 1) % len(MODE_ORDER)]
+        self._theme_pref = nxt
+        self._settings.setValue("theme", nxt)
+        self._apply_theme()
 
     # ---------- UI 구성 ----------
 
@@ -289,8 +328,9 @@ class MainWindow(QMainWindow):
         box = QGroupBox("진행 상황")
         v = QVBoxLayout(box)
         self.count_label = QLabel("")
-        self.count_label.setStyleSheet("font-weight: 600; color: #367e5e;")
+        self.count_label.setObjectName("counts")
         self.status_label = QLabel("준비되면 시작해 주세요")
+        self.status_label.setObjectName("statusText")
         self.status_label.setWordWrap(True)
         self.count_label.setWordWrap(True)
         self.progress_bar = QProgressBar()
@@ -300,7 +340,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setFormat("%p%")
         self.progress_bar.setVisible(False)
         self.time_label = QLabel("")
-        self.time_label.setStyleSheet("color: #555;")
+        self.time_label.setObjectName("timeLabel")
         self.time_label.setVisible(False)
         self.eta = EtaEstimator()
         self._last_fraction = 0.0
@@ -328,6 +368,10 @@ class MainWindow(QMainWindow):
         self.result_table.setVisible(True)
         v.addWidget(self.progress_tabs, 1)
         self.result_table.setWordWrap(False)
+        self.result_table.setAlternatingRowColors(True)
+        self.result_table.setShowGrid(False)
+        self.result_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.result_table.verticalHeader().setDefaultSectionSize(36)
         self.result_table.verticalHeader().setVisible(False)
         self.result_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.result_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
@@ -373,16 +417,27 @@ class MainWindow(QMainWindow):
             rows.append(("자막생성", v.name, "대기열 추가", "'자막 생성 시작'을 누르면 처리"))
         return rows
 
-    def _show_results(self, rows: list[tuple[str, str, str, str]]) -> None:
-        """rows: (구분, 파일, 상태, 결과) 목록을 결과 표에 채운다."""
+    def _show_results(self, rows: list[tuple[str, str, str, str]], switch_tab: bool = True) -> None:
+        """rows: (구분, 파일, 상태, 결과) 목록을 결과 표에 채운다. 상태는 색 + 글자("● 완료")로 보여준다."""
+        self._result_rows = list(rows)
         self.result_table.setRowCount(len(rows))
         for r, (kind, name, status, detail) in enumerate(rows):
-            for c, text in enumerate((kind, name, status, detail)):
+            shown, color_kind = STATUS_STYLE.get(status, (f"● {status}", "idle"))
+            for c, text in enumerate((kind, name, shown, detail)):
                 item = QTableWidgetItem(text)
-                item.setToolTip(text)
+                item.setToolTip(detail if c == 3 else text)
+                if c == 2:
+                    fg, bg = status_colors(self._theme_mode, color_kind)
+                    item.setForeground(QBrush(fg))
+                    item.setBackground(QBrush(bg))
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
                 self.result_table.setItem(r, c, item)
+        self.result_table.resizeColumnToContents(0)
+        self.result_table.resizeColumnToContents(2)
         self.progress_tabs.setTabText(1, f"결과 · {len(rows)}")
-        if rows:
+        if rows and switch_tab:
             self.progress_tabs.setCurrentIndex(1)
 
     def _elapsed_text(self) -> str:
