@@ -19,11 +19,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--videos", nargs="+", required=True, help="영상 파일 경로 (여러 개 가능)")
     p.add_argument("--out-dir", required=True, help="자막을 저장할 폴더")
     p.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="config.yaml 경로")
-    p.add_argument("--precision", choices=["turbo", "large", "kotoba"], help="STT 정밀도 (기본: config.yaml 값)")
+    p.add_argument("--precision", choices=["turbo", "large", "japanese", "kotoba"], help="STT 정밀도 (japanese는 일본어 회화 전용, 기본: config.yaml 값)")
     p.add_argument("--source-lang", help="원어 코드 (기본: config.yaml 값, 예: ja)")
     p.add_argument("--target-lang", help="번역 대상 언어 코드 (기본: config.yaml 값, 예: ko)")
     p.add_argument("--glossary", help="용어집 JSON 파일 경로 ({'원어단어': '번역'} 형식)")
     p.add_argument("--emit-source", action="store_true", help="원문 자막도 함께 생성")
+    p.add_argument("--reprocess", choices=["resume", "translate", "all"], default="resume", help="이어하기 / 번역만 다시 / 음성 인식부터 다시")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -37,6 +38,7 @@ def main(argv=None) -> int:
     )
 
     config = Config.load(args.config)
+    config.set("pipeline.reprocess", args.reprocess)
     if args.precision:
         config.set("stt.precision", args.precision)
     if args.source_lang:
@@ -55,13 +57,16 @@ def main(argv=None) -> int:
         logging.error("파일을 찾을 수 없음: %s", missing)
         return 1
 
-    outputs = run_batch(args.videos, args.out_dir, config, glossary=glossary)
+    reports = {}
+    outputs = run_batch(args.videos, args.out_dir, config, glossary=glossary, reports=reports)
 
     print("\n=== 완료 ===")
     for video, paths in outputs.items():
         print(f"{video}:")
         for p in paths:
             print(f"  - {p}")
+        if video in reports:
+            print(f"  {reports[video].status}: {reports[video].summary()}")
     return 0
 
 

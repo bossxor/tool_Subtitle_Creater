@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 ProgressCB = Optional[Callable[[str, int, int], None]]  # (label, downloaded_bytes, total_bytes)
 
 HF_WHISPER_REPO = {
+    "japanese": "efwkjn/faster-whisper-ja-760M",
     "turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
     "large": "Systran/faster-whisper-large-v3",
     "kotoba": "kotoba-tech/kotoba-whisper-v2.0-faster",
@@ -40,6 +41,7 @@ LLM_FILE = "Qwen3-8B-Q4_K_M.gguf"
 # 번역 전용 모델 (기본 번역 백엔드). 6.6GB, GPU 8GB에 올라가는 4비트 양자화본
 TRANSLATE_REPO = "mradermacher/translategemma-12b-it-GGUF"
 TRANSLATE_FILE = "translategemma-12b-it.IQ4_XS.gguf"
+TRANSLATE_QUALITY_FILE = "translategemma-27b-it.Q4_K_M.gguf"
 
 
 @dataclass
@@ -106,10 +108,14 @@ def _fetch_llm(out_dir: Path) -> Callable[[ProgressCB], None]:
     return _fetch
 
 
-def _fetch_translate_model(out_dir: Path) -> Callable[[ProgressCB], None]:
+def _fetch_translate_model(out_dir: Path, filename: str = TRANSLATE_FILE) -> Callable[[ProgressCB], None]:
+    repos = {TRANSLATE_FILE: TRANSLATE_REPO,
+             TRANSLATE_QUALITY_FILE: "mradermacher/translategemma-27b-it-GGUF"}
     def _fetch(progress_cb: ProgressCB) -> None:
-        dest = out_dir / TRANSLATE_FILE
-        _download_file(_hf_url(TRANSLATE_REPO, TRANSLATE_FILE), dest, f"번역 모델: {TRANSLATE_FILE}", progress_cb)
+        if filename not in repos:
+            raise ValueError(f"번역 모델 파일이 없습니다. 설정한 경로를 확인해 주세요: {out_dir / filename}")
+        dest = out_dir / filename
+        _download_file(_hf_url(repos[filename], filename), dest, f"번역 모델: {filename}", progress_cb)
 
     return _fetch
 
@@ -147,12 +153,12 @@ def list_missing(config, include_verify_model: bool = False) -> list[AssetTask]:
     use_gemma = config.get("llm.translate_backend", "translategemma") == "translategemma"
     if use_gemma:
         translate_model = config.resolve_path("llm.translate_model")
-        if not translate_model.exists():
+        if not translate_model.is_file() or translate_model.stat().st_size == 0:
             tasks.append(
                 AssetTask(
-                    label="번역 모델 (TranslateGemma 12B, 6.6GB)",
+                    label="번역 모델 (TranslateGemma 27B, 16.5GB)" if translate_model.name == TRANSLATE_QUALITY_FILE else "번역 모델 (TranslateGemma 12B, 6.6GB)",
                     check_path=translate_model,
-                    fetch=_fetch_translate_model(translate_model.parent),
+                    fetch=_fetch_translate_model(translate_model.parent, translate_model.name),
                 )
             )
 

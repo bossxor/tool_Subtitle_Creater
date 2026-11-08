@@ -16,12 +16,19 @@ _HAS_KANA_RE = re.compile(r"[぀-ヿー]")
 
 
 def collapse_repeats(text: str, keep: int = 3) -> str:
-    return _REPEAT_RE.sub(lambda m: m.group(1) * keep, text)
+    # Repeated digits, names and real words carry meaning; only shorten nonlexical sounds.
+    return _REPEAT_RE.sub(lambda m: m.group(1) * keep if is_vocalization(m.group(1)) else m.group(0), text)
 
 
 def is_kana_only(text: str) -> bool:
     """한자 없이 가나(와 기호)로만 이뤄졌고 가나가 하나 이상 있으면 True."""
     return bool(_KANA_ONLY_RE.match(text)) and bool(_HAS_KANA_RE.search(text))
+
+
+def is_vocalization(text: str) -> bool:
+    """Only unambiguous nonlexical sounds qualify for transliteration fallback."""
+    text = re.sub(r"[、。！？!?…〜~\s]", "", text)
+    return bool(re.fullmatch(r"(?:あ+[ぁっー]*|ア+[ァッー]*|は[ぁあー]+|ハ[ァアー]+|ふ[ぅうー]+|フ[ゥウー]+|う[ぅー]+|ウ[ゥー]+|え[ぇー]+|エ[ェー]+|お[ぉー]+|オ[ォー]+|ん+|ン+)", text))
 
 
 # ---- 가나 -> 한글 (소리 나는 대로, 단순 규칙) ----
@@ -119,13 +126,15 @@ def kana_to_hangul(text: str) -> str:
 
 # ---- 일본어 말투 판별 (번역 모델에 존댓말/반말 지시를 줄 때 쓴다) ----
 _POLITE_RE = re.compile(
-    r"(です|ます|ません|でした|ました|ましょう|ください|下さい|ございま|いたし|おります|でしょう"
-    r"|^ええ|^はい|すみません|申し訳|失礼|恐れ入|お疲れ様|よろしくお願)"
+    r"(?:(?:です|ます|ません|でした|ました|ましょう|おります|でしょう)"
+    r"(?=$|[\s、。！？!?…」』\"）)]|ね|よ|か|が|けど|ので|のに|から|し|って|と|なら|れば)"
+    r"|ください|下さい|^(?:ええ|はい)(?=$|[\s、。！？!?…])"
+    r"|すみません|ごめんなさい|申し訳|お疲れ様|よろしくお願)"
 )
 _CASUAL_ANYWHERE_RE = re.compile(r"(お前|てめえ|おまえ|あんた|おい|俺|おれ|あたし|うん|ううん|ごめん|悪い|やだ|まじ|やばい|ねえ|なあ|じゃん)")
 _CASUAL_END_RE = re.compile(
     r"(だ|だよ|だね|だろ|だぞ|だぜ|だわ|だって|だっけ|かよ|かな|かい|かしら|っけ|よ|ね|ぞ|ぜ|わ|な|さ|のよ|のね|んだ"
-    r"|ない|なきゃ|なくちゃ|ちゃう|ちゃった|ちゃって|てよ|てね|て|ろ|れ|る|う|く|ぐ|す|つ|ぬ|ぶ|む|い|た|か|たら)$"
+    r"|ない|なきゃ|なくちゃ|ちゃう|ちゃった|ちゃって|てよ|てね|いで|んで|て|ろ|れ|る|う|く|ぐ|す|つ|ぬ|ぶ|む|い|た|か|たら)$"
 )
 _END_STRIP_RE = re.compile(r"[\s、。！？!?…・〜~]+$")
 _SENTENCE_SPLIT_RE = re.compile(r"[。！？!?…]+")

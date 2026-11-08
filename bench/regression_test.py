@@ -25,7 +25,7 @@ from core.pipeline import (
     cache_dir_for, stage_audio, stage_translate, stage_write,
 )
 from core.segmenter import Cue
-from core.setup_assets import WHISPER_FILES, _fetch_whisper_model, list_missing
+from core.setup_assets import WHISPER_FILES, _fetch_whisper_model, _fetch_translate_model, list_missing
 from gui.main_window import MainWindow
 
 
@@ -73,6 +73,15 @@ class CacheTests(unittest.TestCase):
             stage_audio([self.video], self.config)
         extract.assert_not_called()
 
+    def test_quality_model_download_uses_selected_weights(self):
+        filename = "translategemma-27b-it.Q4_K_M.gguf"
+        with patch("core.setup_assets._download_file") as download:
+            _fetch_translate_model(self.root, filename)(None)
+        url, destination, _, _ = download.call_args.args
+        self.assertIn("translategemma-27b-it-GGUF", url)
+        self.assertTrue(url.endswith(filename))
+        self.assertEqual(destination, self.root / filename)
+
     def test_silent_video_needs_no_translation_server(self):
         fractions = []
         tracker = ProgressTracker(1, fractions.append)
@@ -84,11 +93,12 @@ class CacheTests(unittest.TestCase):
 
     def test_translation_cache_hit_needs_no_server(self):
         cache = _translation_cache_file(self.video, self.cues, self.config, None)
-        _write_json(cache, {"0": "translated"})
+        _write_json(cache, {"version": 2, "translations": {"0": "번역됨"},
+                            "report": {"total": 1, "failed_ids": [], "transliterated_ids": [], "issues": {}}})
         with patch("core.pipeline._start_server_with_fallback") as start:
             result = stage_translate([self.video], {self.video: self.cues}, self.config)
         start.assert_not_called()
-        self.assertEqual(result[self.video], {0: "translated"})
+        self.assertEqual(result[self.video], {0: "번역됨"})
 
     def test_failed_ffmpeg_does_not_publish_partial_wav(self):
         out = self.root / "audio.wav"

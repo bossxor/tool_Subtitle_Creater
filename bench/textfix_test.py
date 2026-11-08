@@ -147,7 +147,7 @@ check("report transliterated", rep.transliterated_ids, [1])
 check("report failed", rep.failed_ids, [2])
 temps = [t for p, t in fake.calls if p.endswith("行こう<end_of_turn>\n<start_of_turn>model\n")]
 assert len(temps) == 2 and temps[1] > temps[0], f"재시도에서 온도가 안 올라감: {temps}"
-assert any("Do not use these characters" in p for p, _ in fake.calls), "재시도에 avoid 힌트가 없음"
+assert any("Previous output was invalid" in p for p, _ in fake.calls), "재시도에 검증 실패 힌트가 없음"
 
 # 응답 없음(시간 초과): 서버를 다시 띄우고 같은 줄을 재시도해야 한다
 import requests  # noqa: E402

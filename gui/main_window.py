@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 
 from core.config import Config, DEFAULT_CONFIG_PATH
 from core.pipeline import predict_output_paths
-from core.setup_assets import list_missing
+from core.setup_assets import list_missing, TRANSLATE_FILE, TRANSLATE_QUALITY_FILE
 from core.worklog import LOG_FILENAME
 from gui.asset_worker import AssetDownloadWorker
 from gui.folder_worker import FolderCleanupWorker
@@ -210,6 +210,10 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(clear_btn)
         btn_row.addStretch(1)
         v.addLayout(btn_row)
+        self.review_btn = QPushButton("기존 자막 검사 · 업데이트…")
+        self.review_btn.setToolTip("이 툴의 생성 이력·캐시를 확인하고, 번역 후보를 비교한 뒤 선택 적용합니다.")
+        self.review_btn.clicked.connect(self._on_review_subtitles)
+        v.addWidget(self.review_btn)
 
         folder_hint = QLabel("폴더 추가 후 원하는 파일만 선택할 수 있어요.")
         folder_hint.setObjectName("muted")
@@ -267,8 +271,36 @@ class MainWindow(QMainWindow):
 
         self.precision_combo = QComboBox()
         self.precision_combo.addItem("정확 (large-v3, 권장)", "large")
+        self.precision_combo.addItem("일본어 회화 · 전용 모델 (1.5GB)", "japanese")
         self.precision_combo.addItem("빠름 (large-v3-turbo, 약 3배 빠름)", "turbo")
+        self.precision_combo.setToolTip("일본어 회화 전용 모델은 일반 발화·방송 샘플에서 오류가 적었습니다. 문학 낭독에서는 large-v3가 더 나았습니다.")
+        self.source_lang_combo.currentIndexChanged.connect(self._sync_stt_language)
         form.addWidget(_row(QLabel("음성 인식 속도/정확도:"), self.precision_combo))
+        self.reprocess_combo = QComboBox()
+        self.reprocess_combo.addItem("이어하기 · 완료된 단계 재사용", "resume")
+        self.reprocess_combo.addItem("번역만 다시 · 음성 인식 유지", "translate")
+        self.reprocess_combo.addItem("음성 인식부터 다시", "all")
+        form.addWidget(_row(QLabel("처리 방식:"), self.reprocess_combo))
+        model_config = Config.load(DEFAULT_CONFIG_PATH)
+        self.translation_combo = QComboBox()
+        self.translation_combo.addItem("표준 · 12B (6.6GB)", f"models/llm/{TRANSLATE_FILE}")
+        self.translation_combo.addItem("정밀 · 27B (16.5GB, 느림)", f"models/llm/{TRANSLATE_QUALITY_FILE}")
+        configured_model = model_config.get("llm.translate_model", f"models/llm/{TRANSLATE_FILE}")
+        model_index = self.translation_combo.findData(configured_model)
+        if model_index < 0:
+            self.translation_combo.addItem("사용자 지정 모델", configured_model)
+            model_index = self.translation_combo.count() - 1
+        self.translation_combo.setCurrentIndex(model_index)
+        self.translation_combo.setToolTip("정밀 모드는 메모리 32GB 이상 권장. 8GB GPU에서는 CPU를 함께 사용해 처리 시간이 길어집니다.")
+        self.translation_combo.setEnabled(model_config.get("llm.translate_backend", "translategemma") == "translategemma")
+        form.addWidget(_row(QLabel("번역 품질:"), self.translation_combo))
+        model_name = Path(model_config.get("llm.translate_model", "") if model_config.get("llm.translate_backend", "translategemma") == "translategemma" else model_config.get("llm.model", "")).name
+        model_hint = QLabel(f"번역 모델: {model_name}\n미번역·음역은 완료와 구분해 표시합니다.")
+        model_hint.setWordWrap(True)
+        model_hint.setObjectName("muted")
+        self.translation_combo.currentIndexChanged.connect(lambda _: model_hint.setText(
+            f"번역 모델: {Path(self.translation_combo.currentData()).name}\n미번역·음역은 완료와 구분해 표시합니다."))
+        form.addWidget(model_hint)
 
         fmt_label = QLabel("자막 형식:")
         fmt_label.setToolTip("체크한 형식마다 자막 파일이 하나씩 따로 생성됩니다. 보통은 하나만 선택하세요.")
@@ -385,12 +417,20 @@ class MainWindow(QMainWindow):
             index = combo.findData(config.get(key))
             if index >= 0:
                 combo.setCurrentIndex(index)
+        self._sync_stt_language()
         formats = config.get("subtitle.formats", ["srt"])
         for checkbox, fmt in ((self.format_srt_chk, "srt"), (self.format_ass_chk, "ass"),
                               (self.format_smi_chk, "smi")):
             checkbox.setChecked(fmt in formats)
         self.emit_source_chk.setChecked(config.get("subtitle.emit_source", False))
         self.bilingual_chk.setChecked(config.get("subtitle.bilingual", False))
+
+    def _sync_stt_language(self) -> None:
+        index = self.precision_combo.findData("japanese")
+        japanese = self.source_lang_combo.currentData() == "ja"
+        self.precision_combo.model().item(index).setEnabled(japanese)
+        if not japanese and self.precision_combo.currentData() == "japanese":
+            self.precision_combo.setCurrentIndex(self.precision_combo.findData("large"))
 
     def _refresh_counts(self) -> None:
         self.count_label.setText("\n".join(self.tracker.lines()))
@@ -669,10 +709,30 @@ class MainWindow(QMainWindow):
         config.set("source_language", self.source_lang_combo.currentData())
         config.set("target_language", self.target_lang_combo.currentData())
         config.set("stt.precision", self.precision_combo.currentData())
+        if config.get("llm.translate_backend", "translategemma") == "translategemma":
+            config.set("llm.translate_model", self.translation_combo.currentData())
+            if Path(self.translation_combo.currentData()).name == TRANSLATE_QUALITY_FILE:
+                config.set("llm.translate_parallel", 1)
+                config.set("llm.translate_extra_args", [*config.get("llm.translate_extra_args", ["--no-jinja"]), "-np", "1"])
+        config.set("pipeline.reprocess", self.reprocess_combo.currentData())
         config.set("subtitle.formats", self._selected_formats())
         config.set("subtitle.emit_source", self.emit_source_chk.isChecked())
         config.set("subtitle.bilingual", self.bilingual_chk.isChecked())
         return config
+
+    def _on_review_subtitles(self) -> None:
+        from gui.subtitle_review import SubtitleReviewDialog
+        dialog = SubtitleReviewDialog(self._build_config(), self, glossary=self._collect_glossary())
+
+        def queue_regeneration(videos):
+            self._add_files(videos)
+            self.reprocess_combo.setCurrentIndex(self.reprocess_combo.findData("all"))
+            if not self.out_dir_edit.text().strip():
+                self.out_dir_edit.setText(str(Path(videos[0]).parent))
+            self.status_label.setText("원본 영상을 대기열에 추가했습니다. 저장 위치 확인 후 시작하세요.")
+
+        dialog.regenerate.connect(queue_regeneration)
+        dialog.exec()
 
     def _collect_glossary(self) -> dict[str, str] | None:
         glossary = {}
@@ -706,6 +766,9 @@ class MainWindow(QMainWindow):
 
         config = self._build_config()
         glossary = self._collect_glossary()
+        if config.get("stt.precision") in {"kotoba", "japanese"} and config.get("source_language") != "ja":
+            QMessageBox.warning(self, "언어 확인", "선택한 인식 모델은 일본어 전용입니다. 원어를 일본어로 바꾸거나 다른 인식 모델을 선택해 주세요.")
+            return
 
         predicted = predict_output_paths(videos, out_dir, config)
         existing_files = [p for paths in predicted.values() for p in paths if p.exists()]
@@ -838,7 +901,9 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self.close)
 
     def _on_finished_ok(self, outputs: dict) -> None:
-        self.status_label.setText("완료")
+        reports = getattr(self.worker, "reports", {})
+        flagged = sum(report.status != "완료" for report in reports.values())
+        self.status_label.setText(f"처리 완료 · 검토 필요 {flagged}개" if flagged else "처리 완료")
         self.log_view.appendPlainText(f"작업 로그: {Path(self.out_dir_edit.text().strip()) / LOG_FILENAME}")
         self.tracker.finish_all()
         self._refresh_counts()
@@ -851,12 +916,15 @@ class MainWindow(QMainWindow):
             for p in paths:
                 lines.append(f"  - {p}")
             detail = ", ".join(Path(p).name for p in paths) or "결과 파일 없음"
-            rows.append(("자막생성", Path(video).name, "완료", detail))
+            report = reports.get(Path(video))
+            if report:
+                detail += " · " + report.summary()
+            rows.append(("자막생성", Path(video).name, report.status if report else "완료", detail))
         self.log_view.appendPlainText("\n".join(lines))
         self._show_results(rows)
         self._reset_run_state()
         if not self._close_pending:
-            QMessageBox.information(self, "완료", "자막 생성이 끝났습니다.")
+            QMessageBox.information(self, "처리 완료", f"자막 파일을 저장했습니다. 검토가 필요한 영상 {flagged}개가 있습니다.\n결과 표에서 미번역·음역 개수를 확인하세요." if flagged else "자막 파일을 저장했습니다.")
 
     def _on_cancelled(self) -> None:
         self.status_label.setText("취소됨")

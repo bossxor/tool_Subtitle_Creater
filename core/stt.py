@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 import site
 import sys
 from dataclasses import dataclass
@@ -82,6 +83,10 @@ class STTEngine:
     """모델을 한 번 로드해 여러 영상을 순서대로 처리하기 위한 클래스."""
 
     def __init__(self, model_dir: Path, device: str = "cuda", compute_type: str = "float16"):
+        if "kotoba" in Path(model_dir).name.lower():
+            metadata = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
+            if any(head[0] >= 2 for head in metadata.get("alignment_heads", [])):
+                raise ValueError("현재 Kotoba 변환 모델의 단어 정렬 설정이 2층 디코더와 맞지 않아 충돌할 수 있습니다. large-v3 또는 turbo를 사용해 주세요.")
         self.model = WhisperModel(str(model_dir), device=device, compute_type=compute_type)
         self.pipeline = BatchedInferencePipeline(self.model)
 
@@ -91,14 +96,17 @@ class STTEngine:
         language: Optional[str] = None,
         batch_size: int = 16,
         beam_size: int = 1,
+        hotwords: str | None = None,
     ) -> TranscriptionResult:
         segments, info = self.pipeline.transcribe(
             str(wav_path),
             language=language,
+            task="transcribe",
             beam_size=beam_size,
             batch_size=batch_size,
             word_timestamps=True,
             condition_on_previous_text=False,
+            hotwords=hotwords,
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=500),
         )

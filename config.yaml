@@ -8,6 +8,7 @@ stt:
   # "large"(기본, large-v3: 정확) 또는 "turbo"(약 3배 빠름). 10분 음성에서 large 17초 vs turbo 6초라 시간 차이는 작다
   precision: large
   models:
+    japanese: models/whisper/ja-760m
     turbo: models/whisper/large-v3-turbo
     large: models/whisper/large-v3
     kotoba: models/whisper/kotoba-v2.0

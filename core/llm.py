@@ -58,7 +58,15 @@ class LlamaServer:
 
     def start(self, timeout: float = 180.0) -> None:
         if self.is_alive():
-            return  # 이미 떠 있는 서버 재사용 (다른 곳에서 띄웠거나 이전 실행이 안 죽은 경우)
+            try:
+                response = requests.get(f"{self.base_url}/props", timeout=5)
+                response.raise_for_status()
+                model = response.json().get("model_path", "")
+                if Path(model).resolve() != self.model_path.resolve():
+                    raise LlamaServerError(f"포트 {self.port}에 다른 모델 서버가 실행 중입니다: {model}. 기존 서버를 종료하거나 포트를 바꿔 주세요.")
+            except (requests.RequestException, ValueError, TypeError) as error:
+                raise LlamaServerError(f"포트 {self.port}의 실행 중인 모델을 확인할 수 없습니다.") from error
+            return
 
         if not self.server_exe.exists():
             raise LlamaServerError(f"llama-server 실행파일을 찾을 수 없음: {self.server_exe}")
@@ -161,7 +169,10 @@ class LlamaServer:
             timeout=timeout,
         )
         r.raise_for_status()
-        return r.json()["content"].strip()
+        data = r.json()
+        if data.get("truncated") or data.get("stop_type") == "limit" or data.get("stopped_limit"):
+            raise LlamaServerError("번역 응답이 길이 제한으로 잘렸습니다. 완성된 자막으로 사용할 수 없습니다.")
+        return data["content"].strip()
 
     def chat(
         self,

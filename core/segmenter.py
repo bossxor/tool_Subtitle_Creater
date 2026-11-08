@@ -42,6 +42,8 @@ def build_cues(words: list[Word], config) -> list[Cue]:
 
     n = len(words)
     for i, w in enumerate(words):
+        if buf and w.end - buf[0].start > max_dur:
+            flush()
         buf.append(w)
         cur_dur = buf[-1].end - buf[0].start
         ends_sentence = w.text.rstrip().endswith(SENTENCE_END)
@@ -54,7 +56,7 @@ def build_cues(words: list[Word], config) -> list[Cue]:
     flush()
 
     cues = _filter_hallucinations(raw_cues, config)
-    cues = _merge_tiny_fragments(cues, min_dur)
+    cues = _merge_tiny_fragments(cues, min_dur, pause_gap, max_dur)
 
     for i, c in enumerate(cues):
         c.id = i
@@ -64,19 +66,15 @@ def build_cues(words: list[Word], config) -> list[Cue]:
 def _filter_hallucinations(cues: list[Cue], config) -> list[Cue]:
     blocklist = config.get("segmenter.hallucination_blocklist", []) or []
     out: list[Cue] = []
-    prev_text = None
     for c in cues:
-        if any(b in c.text for b in blocklist):
+        if any(c.text.strip(" \t\r\n。、！？!?…") == b.strip(" \t\r\n。、！？!?…") for b in blocklist):
             continue
-        if c.text == prev_text:
-            # 동일 문장이 연속으로 반복되면(2회차부터) whisper의 반복 환각으로 보고 버린다
-            continue
-        prev_text = c.text
+        # Repeated dialogue can be intentional; repetition alone is not hallucination evidence.
         out.append(c)
     return out
 
 
-def _merge_tiny_fragments(cues: list[Cue], min_dur: float) -> list[Cue]:
+def _merge_tiny_fragments(cues: list[Cue], min_dur: float, pause_gap: float, max_dur: float) -> list[Cue]:
     """너무 짧은(<0.3s) 잔여 조각을 다음 cue에 붙인다. 정상적인 짧은 감탄사(예: min_dur 근처)는 그대로 둔다."""
     if not cues:
         return cues
@@ -85,9 +83,13 @@ def _merge_tiny_fragments(cues: list[Cue], min_dur: float) -> list[Cue]:
     tiny_threshold = min(0.3, min_dur)
     for c in cues:
         if carry is not None:
-            c = Cue(id=c.id, start=carry.start, end=c.end, text=carry.text + c.text)
+            if c.start - carry.end < pause_gap and c.end - carry.start <= max_dur:
+                c = Cue(id=c.id, start=carry.start, end=c.end, text=carry.text + c.text)
+            else:
+                merged.append(carry)
             carry = None
-        if (c.end - c.start) < tiny_threshold and c is not cues[-1]:
+        if ((c.end - c.start) < tiny_threshold and c is not cues[-1]
+                and not c.text.rstrip().endswith(SENTENCE_END)):
             carry = c
             continue
         merged.append(c)

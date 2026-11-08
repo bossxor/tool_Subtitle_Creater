@@ -39,6 +39,7 @@ class PipelineWorker(QThread):
         self.config = config
         self.glossary = glossary
         self._cancel_requested = False
+        self.reports = {}
 
     def request_cancel(self) -> None:
         self._cancel_requested = True
@@ -57,6 +58,7 @@ class PipelineWorker(QThread):
                 progress_cb=self.progress.emit,
                 cancel_check=lambda: self._cancel_requested,
                 progress_fraction_cb=self.progress_fraction.emit,
+                reports=self.reports,
             )
             self.finished_ok.emit({str(k): [str(p) for p in v] for k, v in outputs.items()})
         except PipelineCancelled:

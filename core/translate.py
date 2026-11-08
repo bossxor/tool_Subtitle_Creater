@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from core.errors import PipelineCancelled
 from core.llm import LlamaServer
 from core.segmenter import Cue
-from core.textfix import collapse_repeats, is_kana_only, kana_to_hangul
+from core.textfix import collapse_repeats, is_vocalization, kana_to_hangul
 from core.validate import validate_batch
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,14 @@ class TranslateReport:
     total: int = 0
     failed_ids: list[int] | None = None  # 끝내 번역 못 해서 일본어 원문이 남은 id
     transliterated_ids: list[int] | None = None  # 가나뿐이라 소리 나는 대로 한글로 옮긴 id
+    issues: dict[int, str] = field(default_factory=dict)
+
+    @property
+    def status(self) -> str:
+        return "일부 미번역" if self.failed_ids else ("검토 필요" if self.transliterated_ids else "완료")
+
+    def summary(self) -> str:
+        return f"총 {self.total}줄 · 미번역 {len(self.failed_ids)}줄 · 음역 {len(self.transliterated_ids)}줄"
 
     def __post_init__(self):
         if self.failed_ids is None:
@@ -48,12 +56,14 @@ def _build_system_prompt(source_lang: str, target_lang: str, glossary: dict[str,
         f"'items'의 각 문장을 자연스러운 {tgt} 구어체 대사로 번역하세요.",
         "음성인식 과정에서 생긴 것으로 보이는 어색한 오탈자(동음이의어 오인식 등)는 문맥에 맞게 자연스럽게 교정하세요.",
         "존댓말/반말 등 어조는 문맥과 인물 관계를 보고 판단하세요.",
-        f"중요: 출력 'ko' 필드에는 히라가나, 가타카나, 한자를 단 한 글자도 남기지 말고 전부 {tgt}(한글)로만 표기하세요.",
-        "고유명사(인명, 지명, 작품명)도 한글 발음으로 표기하세요.",
+        f"중요: 출력 'ko' 필드는 {tgt} 번역문만 포함해야 합니다. 설명이나 번역 요청 안내문은 넣지 마세요.",
+        "딱딱한 문어체보다 실제로 말하는 자연스러운 대사로 옮기되, 원문의 존대와 의미를 보존하세요.",
     ]
     if glossary:
         pairs = "; ".join(f"{k} -> {v}" for k, v in glossary.items())
         parts.append(f"다음 용어/인명은 반드시 이렇게 번역하세요: {pairs}")
+    if target_lang == "ko":
+        parts.append("일본 문자를 남기지 말고 인명·지명도 한글로 적으세요. 단, 원문 약어와 용어집의 지정 표기는 유지하세요.")
     parts.append(
         "항목에 'avoid' 필드가 있으면, 이전 번역에 그 글자가 그대로 남아서 거절됐다는 뜻입니다. "
         "그 글자를 쓰지 말고 뜻을 한글로 풀어서 쓰세요."
@@ -145,7 +155,7 @@ def verify_cues(
                     break
                 continue
 
-            vr = validate_batch(expected_ids, raw)
+            vr = validate_batch(expected_ids, raw, target_lang=None)
             by_id.update(vr.by_id)
             if vr.error:
                 logger.warning("검수 배치 검증 문제(attempt %s): %s", attempt, vr.error)
@@ -222,7 +232,8 @@ def translate_cues(
                     break
                 continue
 
-            vr = validate_batch(expected_ids, raw)
+            vr = validate_batch(expected_ids, raw, source_by_id={c.id: c.text for c in pending},
+                                target_lang=target_lang, glossary=glossary)
             by_id.update(vr.by_id)
             if vr.error:
                 logger.warning("번역 배치 검증 문제(attempt %s): %s", attempt, vr.error)
@@ -238,12 +249,13 @@ def translate_cues(
         # 원문을 그대로 둔다 (파이프라인이 멈추지 않게 하고, 어느 줄인지 보고서에 남긴다)
         for c in batch:
             if c.id not in by_id:
-                if is_kana_only(c.text):
+                if target_lang == "ko" and is_vocalization(c.text):
                     by_id[c.id] = kana_to_hangul(c.text)
                     report.transliterated_ids.append(c.id)
                 else:
                     by_id[c.id] = c.text
                     report.failed_ids.append(c.id)
+                    report.issues[c.id] = "재시도 후에도 유효한 번역을 얻지 못함"
 
         results.update(by_id)
         if on_batch_done is not None:
