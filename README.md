@@ -3,6 +3,8 @@
 영상 여러 개를 고르고 자막 저장 폴더를 지정하면, **음성 인식 → 번역 → 다듬기**까지 자동으로 처리해 자막 파일(`.srt`)을 만들어 주는 Windows 데스크톱 도구입니다.
 모든 AI가 **내 PC에서 로컬로** 돌아가므로 API 비용이나 토큰 사용이 없습니다.
 
+Windows 실행 파일: [최신 릴리즈 다운로드](https://github.com/bossxor/tool_Subtitle_Creater/releases/latest). ZIP을 풀고 `Subtitle_Tool.exe`를 실행하세요.
+
 > 내 작업물 대시보드: **https://bossxor.github.io/works-dashboard/**
 
 ## 주요 기능
